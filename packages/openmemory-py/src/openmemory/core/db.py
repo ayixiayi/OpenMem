@@ -30,7 +30,12 @@ class DB:
         else:
             raise ValueError(f"Unsupported database URL schema: {url}. Only sqlite:/// is supported currently.")
 
-        self.run_migrations()
+        try:
+            self.run_migrations()
+        except Exception:
+            self.conn.close()
+            self.conn = None
+            raise
 
     def run_migrations(self):
         c = self.conn
@@ -59,9 +64,13 @@ class DB:
                         pass
                     if not sql:
                         sql = (Path(__file__).parent.parent / "migrations" / f).read_text(encoding="utf-8")
-                    c.executescript(sql)
+                    # executescript commits any preceding transaction; BEGIN must
+                    # be inside the script so DDL and its marker commit together.
+                    c.executescript("BEGIN IMMEDIATE;\n" + sql)
                     c.execute("INSERT INTO _migrations (name, applied_at) VALUES (?, ?)", (f, int(time.time())))
+                    c.commit()
                 except Exception as e:
+                    c.rollback()
                     logger.error(f"[DB] Migration {f} failed: {e}")
                     raise e
 

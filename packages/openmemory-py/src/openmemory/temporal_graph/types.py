@@ -8,7 +8,7 @@ class TemporalFact(TypedDict):
     valid_from: int
     valid_to: Optional[int]
     confidence: float
-    last_updated: int
+    last_updated: Optional[int]
     metadata: Optional[Dict[str, Any]]
 
 class TemporalEdge(TypedDict):

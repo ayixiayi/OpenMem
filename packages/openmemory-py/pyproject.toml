@@ -12,6 +12,8 @@ dependencies = [
     "pydantic",
     "numpy",
     "httpx",
+    "python-dotenv",
+    "PyYAML",
     "google-api-python-client>=2.0",
     "google-auth>=2.0",
     "notion-client>=2.0",

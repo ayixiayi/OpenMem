@@ -173,3 +173,46 @@ CREATE TABLE schema.openmemory_users (
 - **Querying**: Filter by user with `filters: { user_id: "user123" }`
 - **User summaries**: Auto-generated when memories are added per user
 - **Migration tool**: Preserves user_id when importing from Zep/Mem0/Supermemory
+
+## Integrity fixes: scope and Python temporal schema
+
+JS HSG deduplication now matches both the stored `user_id` and `project`.
+Omitted values retain the existing `anonymous` / `default` defaults. Legacy
+NULL-owned memories are not silently assigned to these scopes. Records lost
+through earlier cross-scope deduplication cannot be reconstructed automatically.
+
+In both engines, an unowned temporal write now supersedes only unowned facts,
+not facts belonging to every user. Unscoped reads retain their legacy global
+behavior; this is not a complete tenant authorization system. Single and batch
+temporal inserts roll back supersession if insertion fails. Validity remains
+millisecond-based and inclusive; out-of-order and multi-valued fact policy is
+unchanged.
+
+JS `POST /api/temporal/fact` now forwards optional body `user_id`, and
+`GET /api/temporal/fact` plus `/api/temporal/fact/current` forward optional query
+`user_id`. These are caller-supplied scope filters, not authentication claims.
+Other temporal endpoints retain their existing scope behavior.
+
+Python applies `002_temporal_contract.sql` on the next database connection,
+after `001_initial.sql`. It renames `obj` to `object` and `relation` to
+`relation_type`, adds user/update fields, and assigns stable IDs to legacy edges.
+Existing fact IDs, metadata, confidence and validity intervals are preserved.
+Unknown historical `last_updated` values remain NULL rather than being inferred
+from valid time. Migration DDL and its `_migrations` marker commit atomically.
+
+This upgrade targets the Python `001_initial.sql` schema only. It does **not**
+make JS and Python databases interchangeable, or upgrade manually modified
+schemas. Back up with SQLite's backup API before opening a persistent database
+with the new package, and test on a copy. On failure the pending migration is
+rolled back and the connection is closed; correct the cause before retrying.
+To revert a successfully upgraded database, stop writers and restore the backup
+together with the prior package. Do not merely delete the migration marker.
+
+Offline regression checks (run from each package directory):
+
+```bash
+# JS: the integrity test forces an in-memory SQLite database and synthetic embeddings.
+npx tsx tests/test_integrity.ts
+# Python: all temporal test fixtures use disposable in-memory databases.
+OM_DB_URL=sqlite:///:memory: OM_EMBED_KIND=synthetic python -m pytest -q tests/test_temporal_integrity.py
+```

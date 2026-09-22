@@ -12,25 +12,25 @@ async def insert_fact(subject: str, predicate: str, subject_object: str, valid_f
     fact_id = str(uuid.uuid4())
     now = int(time.time() * 1000)
     valid_from_ts = valid_from if valid_from is not None else now
-    
-    existing_sql = "SELECT id, valid_from FROM temporal_facts WHERE subject=? AND predicate=? AND valid_to IS NULL"
-    existing_params = [subject, predicate]
-    if user_id:
-        existing_sql += " AND user_id=?"
-        existing_params.append(user_id)
-    existing_sql += " ORDER BY valid_from DESC"
-    existing = db.fetchall(existing_sql, tuple(existing_params))
-
-    for old in existing:
-        if old["valid_from"] < valid_from_ts:
-            db.execute("UPDATE temporal_facts SET valid_to=? WHERE id=?", (valid_from_ts - 1, old["id"]))
-
     meta_json = json.dumps(metadata) if metadata else None
+    # A savepoint also composes with batch_insert_facts' outer transaction.
+    db.execute("SAVEPOINT insert_temporal_fact")
+    try:
+        existing = db.fetchall(
+            "SELECT id, valid_from FROM temporal_facts WHERE subject=? AND predicate=? AND valid_to IS NULL AND user_id IS ? ORDER BY valid_from DESC",
+            (subject, predicate, user_id),
+        )
+        for old in existing:
+            if old["valid_from"] < valid_from_ts:
+                db.execute("UPDATE temporal_facts SET valid_to=? WHERE id=?", (valid_from_ts - 1, old["id"]))
 
-    db.execute("INSERT INTO temporal_facts(id, user_id, subject, predicate, object, valid_from, valid_to, confidence, last_updated, metadata) VALUES (?,?,?,?,?,?,NULL,?,?,?)",
-               (fact_id, user_id, subject, predicate, subject_object, valid_from_ts, confidence, now, meta_json))
-
-    db.commit()
+        db.execute("INSERT INTO temporal_facts(id, user_id, subject, predicate, object, valid_from, valid_to, confidence, last_updated, metadata) VALUES (?,?,?,?,?,?,NULL,?,?,?)",
+                   (fact_id, user_id, subject, predicate, subject_object, valid_from_ts, confidence, now, meta_json))
+        db.execute("RELEASE SAVEPOINT insert_temporal_fact")
+    except Exception:
+        db.execute("ROLLBACK TO SAVEPOINT insert_temporal_fact")
+        db.execute("RELEASE SAVEPOINT insert_temporal_fact")
+        raise
     return fact_id
 
 async def update_fact(fact_id: str, confidence: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None):
@@ -80,26 +80,18 @@ async def invalidate_edge(edge_id: str, valid_to: int = None):
     db.execute("UPDATE temporal_edges SET valid_to=? WHERE id=?", (ts, edge_id))
     db.commit()
 
-async def batch_insert_facts(facts: List[Dict[str, Any]]) -> List[str]:
+async def batch_insert_facts(facts: List[Dict[str, Any]], user_id: Optional[str] = None) -> List[str]:
     ids = []
+    db.execute("BEGIN")
     try:
-        db.execute("BEGIN")
-
         now = int(time.time()*1000)
 
         for f in facts:
-            fid = str(uuid.uuid4())
-            sub, pred, obj = f["subject"], f["predicate"], f["object"]
-            vf = f.get("valid_from", now)
-            conf = f.get("confidence", 1.0)
-            meta = f.get("metadata")
-            existing = db.conn.execute("SELECT id, valid_from FROM temporal_facts WHERE subject=? AND predicate=? AND valid_to IS NULL", (sub, pred)).fetchall()
-            for old in existing:
-                 if old["valid_from"] < vf:
-                     db.conn.execute("UPDATE temporal_facts SET valid_to=? WHERE id=?", (vf - 1, old["id"]))
-
-            db.conn.execute("INSERT INTO temporal_facts(id, subject, predicate, object, valid_from, valid_to, confidence, last_updated, metadata) VALUES (?,?,?,?,?,NULL,?,?,?)",
-               (fid, sub, pred, obj, vf, conf, now, json.dumps(meta) if meta else None))
+            fid = await insert_fact(
+                f["subject"], f["predicate"], f["object"],
+                f.get("valid_from", now), f.get("confidence", 1.0),
+                f.get("metadata"), user_id,
+            )
             ids.append(fid)
 
         db.execute("COMMIT")

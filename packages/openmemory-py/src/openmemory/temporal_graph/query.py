@@ -162,7 +162,7 @@ async def get_related_facts(fact_id: str, relation_type: str = None, at: int = N
 def format_fact(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": row["id"],
-        "user_id": row.get("user_id"),
+        "user_id": row["user_id"] if "user_id" in row.keys() else None,
         "subject": row["subject"],
         "predicate": row["predicate"],
         "object": row["object"],

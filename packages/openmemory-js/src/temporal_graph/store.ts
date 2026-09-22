@@ -1,8 +1,28 @@
-import { run_async, get_async, all_async } from '../core/db'
+import { run_async, get_async, all_async, transaction } from '../core/db'
 import { TemporalFact, TemporalEdge } from './types'
 import { randomUUID } from 'crypto'
 
 export const insert_fact = async (
+    subject: string,
+    predicate: string,
+    object: string,
+    valid_from: Date = new Date(),
+    confidence: number = 1.0,
+    metadata?: Record<string, any>,
+    user_id?: string
+): Promise<string> => {
+    await transaction.begin()
+    try {
+        const id = await insert_fact_in_transaction(subject, predicate, object, valid_from, confidence, metadata, user_id)
+        await transaction.commit()
+        return id
+    } catch (error) {
+        await transaction.rollback()
+        throw error
+    }
+}
+
+const insert_fact_in_transaction = async (
     subject: string,
     predicate: string,
     object: string,
@@ -17,7 +37,8 @@ export const insert_fact = async (
 
     const existing = await all_async(`
         SELECT id, valid_from FROM temporal_facts
-        WHERE subject = ? AND predicate = ? AND valid_to IS NULL${user_id ? ' AND user_id = ?' : ''}
+        WHERE subject = ? AND predicate = ? AND valid_to IS NULL
+        AND ${user_id ? 'user_id = ?' : 'user_id IS NULL'}
         ORDER BY valid_from DESC
     `, user_id ? [subject, predicate, user_id] : [subject, predicate])
 
@@ -107,10 +128,10 @@ export const batch_insert_facts = async (facts: Array<{
 }>, user_id?: string): Promise<string[]> => {
     const ids: string[] = []
 
-    await run_async('BEGIN TRANSACTION')
+    await transaction.begin()
     try {
         for (const fact of facts) {
-            const id = await insert_fact(
+            const id = await insert_fact_in_transaction(
                 fact.subject,
                 fact.predicate,
                 fact.object,
@@ -121,10 +142,10 @@ export const batch_insert_facts = async (facts: Array<{
             )
             ids.push(id)
         }
-        await run_async('COMMIT')
+        await transaction.commit()
         console.log(`[TEMPORAL] Batch inserted ${ids.length} facts`)
     } catch (error) {
-        await run_async('ROLLBACK')
+        await transaction.rollback()
         throw error
     }
 

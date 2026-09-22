@@ -1053,18 +1053,6 @@ export async function add_hsg_memory(
     deduplicated?: boolean;
 }> {
     const simhash = compute_simhash(content);
-    const existing = await q.get_mem_by_simhash.get(simhash);
-    if (existing && hamming_dist(simhash, existing.simhash) <= 3) {
-        const now = Date.now();
-        const boosted_sal = Math.min(1, existing.salience + 0.15);
-        await q.upd_seen.run(existing.id, now, boosted_sal, now);
-        return {
-            id: existing.id,
-            primary_sector: existing.primary_sector,
-            sectors: [existing.primary_sector],
-            deduplicated: true,
-        };
-    }
     const id = crypto.randomUUID();
     const now = Date.now();
 
@@ -1079,6 +1067,20 @@ export async function add_hsg_memory(
     const all_sectors = [classification.primary, ...classification.additional];
     await transaction.begin();
     try {
+        const existing = await q.get_mem_by_simhash.get(
+            simhash, user_id || "anonymous", project ?? "default",
+        );
+        if (existing && hamming_dist(simhash, existing.simhash) <= 3) {
+            const boosted_sal = Math.min(1, existing.salience + 0.15);
+            await q.upd_seen.run(existing.id, now, boosted_sal, now);
+            await transaction.commit();
+            return {
+                id: existing.id,
+                primary_sector: existing.primary_sector,
+                sectors: [existing.primary_sector],
+                deduplicated: true,
+            };
+        }
         const max_seg_res = await q.get_max_segment.get();
         let cur_seg = max_seg_res?.max_seg ?? 0;
         const seg_cnt_res = await q.get_segment_count.get(cur_seg);

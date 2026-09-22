@@ -17,7 +17,7 @@ type q_type = {
     upd_mem_with_sector: { run: (...p: any[]) => Promise<void> };
     del_mem: { run: (...p: any[]) => Promise<void> };
     get_mem: { get: (id: string) => Promise<any> };
-    get_mem_by_simhash: { get: (simhash: string) => Promise<any> };
+    get_mem_by_simhash: { get: (simhash: string, user_id: string, project: string) => Promise<any> };
     all_mem: { all: (limit: number, offset: number) => Promise<any[]> };
     all_mem_by_sector: {
         all: (sector: string, limit: number, offset: number) => Promise<any[]>;
@@ -359,10 +359,10 @@ if (is_pg) {
             get: (id) => get_async(`select * from ${m} where id=$1`, [id]),
         },
         get_mem_by_simhash: {
-            get: (simhash) =>
+            get: (simhash, user_id, project) =>
                 get_async(
-                    `select * from ${m} where simhash=$1 order by salience desc limit 1`,
-                    [simhash],
+                    `select * from ${m} where simhash=$1 and user_id=$2 and project=$3 order by salience desc limit 1`,
+                    [simhash, user_id, project],
                 ),
         },
         all_mem: {
@@ -848,10 +848,10 @@ if (is_pg) {
             get: (id) => one("select * from memories where id=?", [id]),
         },
         get_mem_by_simhash: {
-            get: (simhash) =>
+            get: (simhash, user_id, project) =>
                 one(
-                    "select * from memories where simhash=? order by salience desc limit 1",
-                    [simhash],
+                    "select * from memories where simhash=? and user_id=? and project=? order by salience desc limit 1",
+                    [simhash, user_id, project],
                 ),
         },
         all_mem: {
