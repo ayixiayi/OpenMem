@@ -11,7 +11,7 @@ export class PostgresVectorStore implements VectorStore {
     private table: string;
     private usePgVector: boolean;
 
-    constructor(private db: DbOps, tableName: string = "vectors", usePgVector: boolean = false) {
+    constructor(private db: DbOps, tableName: string = "vectors", usePgVector: boolean = false, private memoriesTable: string = "memories") {
         this.table = tableName;
         this.usePgVector = usePgVector;
         console.error(`[PostgresVectorStore] mode: ${usePgVector ? 'pgvector (native)' : 'sqlite (compat)'}`);
@@ -38,7 +38,7 @@ export class PostgresVectorStore implements VectorStore {
         await this.db.run_async(`delete from ${this.table} where id=$1`, [id]);
     }
 
-    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string): Promise<Array<{ id: string; score: number }>> {
+    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
         if (this.usePgVector) {
             const v_str = JSON.stringify(queryVec);
             let filter_sql = "where sector = $2";
@@ -47,6 +47,11 @@ export class PostgresVectorStore implements VectorStore {
             if (user_id) {
                 filter_sql += " and user_id = $4";
                 args.push(user_id);
+            }
+
+            if (project) {
+                args.push(project);
+                filter_sql += ` and id in (select id from ${this.memoriesTable} where project=$${args.length})`;
             }
 
             const sql = `
@@ -66,6 +71,11 @@ export class PostgresVectorStore implements VectorStore {
             if (user_id) {
                 filter_sql += " and user_id=$2";
                 args.push(user_id);
+            }
+
+            if (project) {
+                args.push(project);
+                filter_sql += ` and id in (select id from ${this.memoriesTable} where project=$${args.length})`;
             }
 
             const rows = await this.db.all_async(`select id,v,dim from ${this.table} ${filter_sql}`, args);

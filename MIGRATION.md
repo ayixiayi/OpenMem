@@ -216,3 +216,22 @@ npx tsx tests/test_integrity.ts
 # Python: all temporal test fixtures use disposable in-memory databases.
 OM_DB_URL=sqlite:///:memory: OM_EMBED_KIND=synthetic python -m pytest -q tests/test_temporal_integrity.py
 ```
+
+## JS project retrieval and waypoint boundaries
+
+Project filters now apply before vector top-k selection. SQLite and PostgreSQL
+use the metadata table's project field; no vector schema migration is needed.
+Valkey scoped queries resolve eligible IDs from metadata and fetch their binary
+vectors in batches of 100 before exact ranking. This avoids global KNN
+post-filter starvation but costs a scan of the scoped vectors; large-scope
+latency still needs measurement. Direct Valkey adapters must supply the metadata
+resolver for project searches, otherwise the call fails rather than ignoring
+the project.
+
+HSG waypoint creation, traversal, coactivation and linked reinforcement now
+require matching stored user and project on both endpoints, including for
+unscoped queries. Existing cross-scope edges remain stored but are not followed
+or reinforced. NULL scopes are not silently equated with named defaults.
+Unscoped vector retrieval still searches all scopes. These are data boundaries,
+not caller authorization; summaries, wakeup and temporal authorization require
+separate work. Run `npx tsx tests/test_scope.ts` for the offline regression suite.

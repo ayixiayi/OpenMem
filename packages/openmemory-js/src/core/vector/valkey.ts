@@ -6,7 +6,7 @@ import { vectorToBuffer, bufferToVector } from "../../memory/embed";
 export class ValkeyVectorStore implements VectorStore {
     private client: Redis;
 
-    constructor() {
+    constructor(private scopedMemoryIds?: (user_id?: string, project?: string) => Promise<string[]>) {
         this.client = new Redis({
             host: env.valkey_host || "localhost",
             port: env.valkey_port || 6379,
@@ -61,7 +61,26 @@ export class ValkeyVectorStore implements VectorStore {
         } while (cursor !== "0");
     }
 
-    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string): Promise<Array<{ id: string; score: number }>> {
+    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
+        // Metadata is authoritative for scope. Rank its vectors before limiting;
+        // a global KNN followed by filtering can discard every eligible memory.
+        if ((user_id || project) && this.scopedMemoryIds) {
+            const ids = await this.scopedMemoryIds(user_id, project);
+            const results: Array<{ id: string; score: number }> = [];
+            for (let offset = 0; offset < ids.length; offset += 100) {
+                const batch = ids.slice(offset, offset + 100);
+                const pipeline = this.client.pipeline();
+                for (const id of batch) pipeline.hgetBuffer(this.getKey(id, sector), "v");
+                const rows = await pipeline.exec();
+                rows?.forEach(([error, value], index) => {
+                    if (error) throw error;
+                    if (value) results.push({ id: batch[index], score: this.cosineSimilarity(queryVec, bufferToVector(value as Buffer)) });
+                });
+            }
+            results.sort((a, b) => b.score - a.score);
+            return results.slice(0, topK);
+        }
+        if (project) throw new Error("Project search requires a metadata scope resolver");
         // Valkey/Redis doesn't support user_id filtering in FT.SEARCH easily
         // For now we'll need to post-filter or use a more complex query
         const indexName = `idx:${sector}`;

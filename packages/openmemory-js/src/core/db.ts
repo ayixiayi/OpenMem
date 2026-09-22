@@ -81,6 +81,15 @@ let q: q_type;
 let vector_store: VectorStore;
 let memories_table: string;
 
+async function scoped_memory_ids(user_id?: string, project?: string): Promise<string[]> {
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (user_id) { conditions.push("user_id=?"); params.push(user_id); }
+    if (project) { conditions.push("project=?"); params.push(project); }
+    const rows = await all_async(`select id from ${memories_table}${conditions.length ? ` where ${conditions.join(" and ")}` : ""}`, params);
+    return rows.map(row => row.id);
+}
+
 const is_pg = env.metadata_backend === "postgres";
 
 
@@ -285,11 +294,11 @@ if (is_pg) {
 
 
         if (env.vector_backend === "valkey") {
-            vector_store = new ValkeyVectorStore();
+            vector_store = new ValkeyVectorStore(scoped_memory_ids);
             console.error("[DB] Using Valkey VectorStore");
         } else {
             const vt = process.env.OM_VECTOR_TABLE || "openmemory_vectors";
-            vector_store = new PostgresVectorStore({ run_async, get_async, all_async }, v.replace(/"/g, ""), true);
+            vector_store = new PostgresVectorStore({ run_async, get_async, all_async }, v.replace(/"/g, ""), true, m);
             console.error(`[DB] Using Postgres VectorStore with table: ${v}`);
         }
     };
@@ -737,7 +746,7 @@ if (is_pg) {
 
 
     if (env.vector_backend === "valkey") {
-        vector_store = new ValkeyVectorStore();
+        vector_store = new ValkeyVectorStore(scoped_memory_ids);
         console.error("[DB] Using Valkey VectorStore");
     } else {
         vector_store = new PostgresVectorStore({ run_async, get_async, all_async }, sqlite_vector_table);
@@ -927,7 +936,7 @@ if (is_pg) {
         upd_waypoint: {
             run: (...p) =>
                 exec(
-                    "update waypoints set weight=?,updated_at=? where src_id=? and dst_id=?",
+                    "update waypoints set weight=?2,updated_at=?3 where src_id=?1 and dst_id=?4",
                     p,
                 ),
         },

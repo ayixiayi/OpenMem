@@ -444,7 +444,13 @@ import {
     run_async,
     transaction,
     log_maint_op,
+    memories_table,
 } from "../core/db";
+
+function same_memory_scope(a: any, b: any): boolean {
+    return !!a && !!b && a.user_id === b.user_id && a.project === b.project;
+}
+
 export async function create_cross_sector_waypoints(
     prim_id: string,
     prim_sec: string,
@@ -506,9 +512,13 @@ export async function create_single_waypoint(
     user_id?: string | null,
 ): Promise<void> {
     const thresh = 0.75;
-    const mems = user_id
-        ? await q.all_mem_by_user.all(user_id, 1000, 0)
-        : await q.all_mem.all(1000, 0);
+    const source = await q.get_mem.get(new_id);
+    if (!source) return;
+    const params = [source.user_id, source.project].filter(value => value != null);
+    const mems = await all_async(
+        `select * from ${memories_table} where user_id ${source.user_id == null ? "is null" : "= ?"} and project ${source.project == null ? "is null" : "= ?"} order by created_at desc limit 1000`,
+        params,
+    );
     let best: { id: string; similarity: number } | null = null;
     for (const mem of mems) {
         if (mem.id === new_id || !mem.mean_vec) continue;
@@ -540,9 +550,12 @@ export async function create_inter_mem_waypoints(
 ): Promise<void> {
     const thresh = 0.75;
     const wt = 0.5;
+    const source = await q.get_mem.get(new_id);
+    if (!source) return;
     const vecs = await vector_store.getVectorsBySector(prim_sec);
     for (const vr of vecs) {
         if (vr.id === new_id) continue;
+        if (!same_memory_scope(source, await q.get_mem.get(vr.id))) continue;
         const ex_vec = vr.vector;
         const sim = cos_sim(new Float32Array(new_vec), new Float32Array(ex_vec));
         if (sim >= thresh) {
@@ -572,8 +585,11 @@ export async function create_contextual_waypoints(
     user_id?: string | null,
 ): Promise<void> {
     const now = Date.now();
+    const source = await q.get_mem.get(mem_id);
+    if (!source) return;
     for (const rel_id of rel_ids) {
         if (mem_id === rel_id) continue;
+        if (!same_memory_scope(source, await q.get_mem.get(rel_id))) continue;
         const existing = await q.get_waypoint.get(mem_id, rel_id);
         if (existing) {
             const new_wt = Math.min(1.0, existing.weight + 0.1);
@@ -593,10 +609,14 @@ export async function create_contextual_waypoints(
 export async function expand_via_waypoints(
     init_res: string[],
     max_exp: number = 10,
+    scope?: { user_id?: string; project?: string },
 ): Promise<Array<{ id: string; weight: number; path: string[] }>> {
     const exp: Array<{ id: string; weight: number; path: string[] }> = [];
     const vis = new Set<string>();
     for (const id of init_res) {
+        const memory = await q.get_mem.get(id);
+        if (!memory || (scope?.user_id && memory.user_id !== scope.user_id) ||
+            (scope?.project && memory.project !== scope.project)) continue;
         exp.push({ id, weight: 1.0, path: [id] });
         vis.add(id);
     }
@@ -604,9 +624,11 @@ export async function expand_via_waypoints(
     let exp_cnt = 0;
     while (q_arr.length > 0 && exp_cnt < max_exp) {
         const cur = q_arr.shift()!;
+        const source = await q.get_mem.get(cur.id);
         const neighs = await q.get_neighbors.all(cur.id);
         for (const neigh of neighs) {
             if (vis.has(neigh.dst_id)) continue;
+            if (!same_memory_scope(source, await q.get_mem.get(neigh.dst_id))) continue;
 
             const neigh_wt = Math.min(1.0, Math.max(0, neigh.weight || 0));
             const exp_wt = cur.weight * neigh_wt * 0.8;
@@ -629,6 +651,7 @@ export async function reinforce_waypoints(trav_path: string[]): Promise<void> {
     for (let i = 0; i < trav_path.length - 1; i++) {
         const src_id = trav_path[i];
         const dst_id = trav_path[i + 1];
+        if (!same_memory_scope(await q.get_mem.get(src_id), await q.get_mem.get(dst_id))) continue;
         const wp = await q.get_waypoint.get(src_id, dst_id);
         if (wp) {
             const new_wt = Math.min(
@@ -725,7 +748,7 @@ setInterval(async () => {
                 q.get_mem.get(a),
                 q.get_mem.get(b),
             ]);
-            if (!memA || !memB) continue;
+            if (!same_memory_scope(memA, memB)) continue;
             const time_diff = Math.abs(memA.last_seen_at - memB.last_seen_at);
             const temp_fact = Math.exp(-time_diff / tau_ms);
             const wp = await q.get_waypoint.get(a, b);
@@ -800,7 +823,7 @@ export async function hsg_query(
         > = {};
         for (const s of ss) {
             const qv = qe[s];
-            const results = await vector_store.searchSimilar(s, qv, k * 3, f?.user_id);
+            const results = await vector_store.searchSimilar(s, qv, k * 3, f?.user_id, f?.project);
             sr[s] = results.map(r => ({ id: r.id, similarity: r.score }));
         }
         const all_sims = Object.values(sr).flatMap((r) =>
@@ -816,7 +839,7 @@ export async function hsg_query(
         for (const r of Object.values(sr)) for (const x of r) ids.add(x.id);
         const exp = high_conf
             ? []
-            : await expand_via_waypoints(Array.from(ids), k * 2);
+            : await expand_via_waypoints(Array.from(ids), k * 2, f);
         for (const e of exp) ids.add(e.id);
 
         let keyword_scores = new Map<string, number>();
@@ -950,10 +973,13 @@ export async function hsg_query(
             if (r.path.length > 1) {
                 await reinforce_waypoints(r.path);
                 const wps = await q.get_waypoints_by_src.all(r.id);
-                const lns = wps.map((wp: any) => ({
-                    target_id: wp.dst_id,
-                    weight: wp.weight,
-                }));
+                const source = await q.get_mem.get(r.id);
+                const lns: Array<{ target_id: string; weight: number }> = [];
+                for (const wp of wps) {
+                    if (same_memory_scope(source, await q.get_mem.get(wp.dst_id))) {
+                        lns.push({ target_id: wp.dst_id, weight: wp.weight });
+                    }
+                }
                 const pru =
                     await propagateAssociativeReinforcementToLinkedNodes(
                         r.id,
@@ -962,7 +988,7 @@ export async function hsg_query(
                     );
                 for (const u of pru) {
                     const linked_mem = await q.get_mem.get(u.node_id);
-                    if (linked_mem) {
+                    if (same_memory_scope(source, linked_mem)) {
                         const time_diff =
                             (Date.now() - linked_mem.last_seen_at) / 86400000;
                         const decay_fact = Math.exp(-0.02 * time_diff);
