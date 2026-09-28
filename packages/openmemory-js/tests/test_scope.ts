@@ -132,6 +132,8 @@ async function main() {
     await q.ins_waypoint.run("a", "b", "alice", 0.7, now, now);
     await q.ins_waypoint.run("b", "d", "alice", 0.8, now, now);
     const before = await all_async("select * from waypoints order by src_id");
+    assert.deepEqual(await q.get_neighbors.all("a"), []);
+    assert.deepEqual(await q.get_waypoints_by_src.all("a"), []);
     assert.deepEqual(
         (
             await hsg.expand_via_waypoints(["a"], 10, {
@@ -152,6 +154,11 @@ async function main() {
     );
     await q.ins_waypoint.run("a", "d", "alice", 0.7, now, now);
     await q.ins_waypoint.run("d", "c", "alice", 0.8, now, now);
+    assert.deepEqual(
+        (await q.get_waypoints_by_src.all("a")).map((row) => row.dst_id),
+        ["d"],
+    );
+    assert.deepEqual(await q.get_waypoints_by_src.all("d"), []);
     assert.deepEqual(
         (await hsg.expand_via_waypoints(["a"], 10)).map((r) => r.id),
         ["a", "d"],

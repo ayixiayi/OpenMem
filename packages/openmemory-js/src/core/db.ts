@@ -1,5 +1,7 @@
 import sqlite3 from "sqlite3";
-import { Pool, PoolClient } from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Pool } from "pg";
+import { postgres_transactions } from "./postgres_transaction";
 import { env } from "./cfg";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,18 +9,57 @@ import { VectorStore } from "./vector_store";
 import { PostgresVectorStore } from "./vector/postgres";
 import { ValkeyVectorStore } from "./vector/valkey";
 
+type memory_filters = { user_id?: string; project?: string; sector?: string };
+
 type q_type = {
-    ins_mem: { run: (...p: any[]) => Promise<void> };
+    ins_mem: {
+        run: (
+            id: string,
+            user_id: string | null,
+            segment: number,
+            content: string,
+            simhash: string | null,
+            primary_sector: string,
+            tags: string | null,
+            meta: string | null,
+            created_at: number,
+            updated_at: number,
+            last_seen_at: number,
+            salience: number,
+            decay_lambda: number,
+            version: number,
+            mean_dim: number | null,
+            mean_vec: Buffer | null,
+            compressed_vec: Buffer | null,
+            feedback_score: number,
+            project: string,
+            session_id: string | null,
+            observation_type: string,
+        ) => Promise<void>;
+    };
     upd_mean_vec: { run: (...p: any[]) => Promise<void> };
-    upd_compressed_vec: { run: (...p: any[]) => Promise<void> };
-    upd_feedback: { run: (...p: any[]) => Promise<void> };
-    upd_seen: { run: (...p: any[]) => Promise<void> };
+    upd_compressed_vec: { run: (vector: Buffer, id: string) => Promise<void> };
+    upd_feedback: { run: (id: string, score: number) => Promise<void> };
+    upd_seen: {
+        run: (
+            id: string,
+            seen_at: number,
+            salience: number,
+            updated_at: number,
+        ) => Promise<void>;
+    };
     upd_mem: { run: (...p: any[]) => Promise<void> };
     upd_mem_with_sector: { run: (...p: any[]) => Promise<void> };
     del_mem: { run: (...p: any[]) => Promise<void> };
     get_mem: { get: (id: string) => Promise<any> };
-    get_mem_by_simhash: { get: (simhash: string, user_id: string, project: string) => Promise<any> };
-    all_mem: { all: (limit: number, offset: number) => Promise<any[]> };
+    get_mem_by_simhash: {
+        get: (
+            simhash: string,
+            user_id: string,
+            project: string,
+        ) => Promise<any>;
+    };
+    all_mem: { all: (limit: number, offset: number, filters?: memory_filters) => Promise<any[]> };
     all_mem_by_sector: {
         all: (sector: string, limit: number, offset: number) => Promise<any[]>;
     };
@@ -29,10 +70,18 @@ type q_type = {
         all: (project: string, limit: number, offset: number) => Promise<any[]>;
     };
     timeline_before: {
-        all: (project: string, created_at: number, limit: number) => Promise<any[]>;
+        all: (
+            project: string,
+            created_at: number,
+            limit: number,
+        ) => Promise<any[]>;
     };
     timeline_after: {
-        all: (project: string, created_at: number, limit: number) => Promise<any[]>;
+        all: (
+            project: string,
+            created_at: number,
+            limit: number,
+        ) => Promise<any[]>;
     };
     fts_search: { all: (query: string, limit: number) => Promise<any[]> };
     count_by_project: { get: (project: string) => Promise<any> };
@@ -49,7 +98,11 @@ type q_type = {
     end_session: { run: (...p: any[]) => Promise<void> };
     ins_summary: { run: (...p: any[]) => Promise<void> };
     get_summaries_by_project: {
-        all: (project: string, limit: number) => Promise<any[]>;
+        all: (
+            project: string,
+            limit: number,
+            user_id?: string,
+        ) => Promise<any[]>;
     };
 
     ins_waypoint: { run: (...p: any[]) => Promise<void> };
@@ -60,12 +113,12 @@ type q_type = {
     del_waypoints: { run: (...p: any[]) => Promise<void> };
     prune_waypoints: { run: (threshold: number) => Promise<void> };
     ins_log: { run: (...p: any[]) => Promise<void> };
-    upd_log: { run: (...p: any[]) => Promise<void> };
+    upd_log: { run: (status: string, error: string | null, id: string) => Promise<void> };
     get_pending_logs: { all: () => Promise<any[]> };
     get_failed_logs: { all: () => Promise<any[]> };
     ins_user: { run: (...p: any[]) => Promise<void> };
     get_user: { get: (user_id: string) => Promise<any> };
-    upd_user_summary: { run: (...p: any[]) => Promise<void> };
+    upd_user_summary: { run: (user_id: string, summary: string, updated_at: number) => Promise<void> };
     clear_all: { run: () => Promise<void> };
 };
 
@@ -73,13 +126,26 @@ let run_async: (sql: string, p?: any[]) => Promise<void>;
 let get_async: (sql: string, p?: any[]) => Promise<any>;
 let all_async: (sql: string, p?: any[]) => Promise<any[]>;
 let transaction: {
-    begin: () => Promise<void>;
-    commit: () => Promise<void>;
-    rollback: () => Promise<void>;
+    run: <T>(work: () => Promise<T>) => Promise<T>;
 };
 let q: q_type;
 let vector_store: VectorStore;
 let memories_table: string;
+
+async function list_memories(limit: number, offset: number, filters: memory_filters = {}): Promise<any[]> {
+    const conditions: string[] = [];
+    const params: any[] = [];
+    for (const [column, value] of [["user_id", filters.user_id], ["project", filters.project], ["primary_sector", filters.sector]]) {
+        if (value) {
+            conditions.push(`${column}=?`);
+            params.push(value);
+        }
+    }
+    return all_async(
+        `select * from ${memories_table}${conditions.length ? ` where ${conditions.join(" and ")}` : ""} order by created_at desc,id desc limit ? offset ?`,
+        [...params, limit, offset],
+    );
+}
 
 async function scoped_memory_ids(user_id?: string, project?: string): Promise<string[]> {
     const conditions: string[] = [];
@@ -117,7 +183,7 @@ if (is_pg) {
             ssl,
         });
     let pg = pool(db_name);
-    let cli: PoolClient | null = null;
+    const pg_transactions = postgres_transactions(() => pg);
     const sc = process.env.OM_PG_SCHEMA || "public";
     const m = `"${sc}"."${process.env.OM_PG_TABLE || "openmemory_memories"}"`;
     memories_table = m;
@@ -128,39 +194,14 @@ if (is_pg) {
     const s = `"${sc}"."openmemory_sessions"`;
     const sm = `"${sc}"."openmemory_summaries"`;
     const exec = async (sql: string, p: any[] = []) => {
-        const c = cli || pg;
-        return (await c.query(convertPlaceholders(sql), p)).rows;
+        return (await pg_transactions.query(convertPlaceholders(sql), p)).rows;
     };
     run_async = async (sql, p = []) => {
         await exec(sql, p);
     };
     get_async = async (sql, p = []) => (await exec(sql, p))[0];
     all_async = async (sql, p = []) => await exec(sql, p);
-    transaction = {
-        begin: async () => {
-            if (cli) throw new Error("transaction active");
-            cli = await pg.connect();
-            await cli.query("BEGIN");
-        },
-        commit: async () => {
-            if (!cli) return;
-            try {
-                await cli.query("COMMIT");
-            } finally {
-                cli.release();
-                cli = null;
-            }
-        },
-        rollback: async () => {
-            if (!cli) return;
-            try {
-                await cli.query("ROLLBACK");
-            } finally {
-                cli.release();
-                cli = null;
-            }
-        },
-    };
+    transaction = { run: pg_transactions.run };
     let ready = false;
     const wait_ready = () =>
         new Promise<void>((ok) => {
@@ -334,7 +375,7 @@ if (is_pg) {
         },
         upd_compressed_vec: {
             run: (...p) =>
-                run_async(`update ${m} set compressed_vec=$2 where id=$1`, p),
+                run_async(`update ${m} set compressed_vec=$1 where id=$2`, p),
         },
         upd_feedback: {
             run: (...p) =>
@@ -375,11 +416,7 @@ if (is_pg) {
                 ),
         },
         all_mem: {
-            all: (limit, offset) =>
-                all_async(
-                    `select * from ${m} order by created_at desc limit $1 offset $2`,
-                    [limit, offset],
-                ),
+            all: list_memories,
         },
         all_mem_by_sector: {
             all: (sector, limit, offset) =>
@@ -426,14 +463,14 @@ if (is_pg) {
         get_neighbors: {
             all: (src) =>
                 all_async(
-                    `select dst_id,weight from ${w} where src_id=$1 order by weight desc`,
+                    `select edge.dst_id,edge.weight from ${w} edge join ${m} source on source.id::text=edge.src_id join ${m} target on target.id::text=edge.dst_id where edge.src_id=$1 and source.user_id is not distinct from target.user_id and source.project is not distinct from target.project order by edge.weight desc`,
                     [src],
                 ),
         },
         get_waypoints_by_src: {
             all: (src) =>
                 all_async(
-                    `select src_id,dst_id,weight,created_at,updated_at from ${w} where src_id=$1`,
+                    `select edge.src_id,edge.dst_id,edge.weight,edge.created_at,edge.updated_at from ${w} edge join ${m} source on source.id::text=edge.src_id join ${m} target on target.id::text=edge.dst_id where edge.src_id=$1 and source.user_id is not distinct from target.user_id and source.project is not distinct from target.project`,
                     [src],
                 ),
         },
@@ -467,7 +504,7 @@ if (is_pg) {
         },
         upd_log: {
             run: (...p) =>
-                run_async(`update ${l} set status=$2,err=$3 where id=$1`, p),
+                run_async(`update ${l} set status=$1,err=$2 where id=$3`, p),
         },
         get_pending_logs: {
             all: () =>
@@ -527,7 +564,7 @@ if (is_pg) {
         ins_session: {
             run: (...p) =>
                 run_async(
-                    `insert into ${s}(id,project,started_at,user_id) values($1,$2,$3,$4) on conflict(id) do update set project=excluded.project,started_at=excluded.started_at,user_id=excluded.user_id`,
+                    `insert into ${s}(id,project,started_at,user_id) values($1,$2,$3,$4) on conflict(id) do nothing`,
                     p,
                 ),
         },
@@ -545,10 +582,10 @@ if (is_pg) {
                 ),
         },
         get_summaries_by_project: {
-            all: (project, limit) =>
+            all: (project, limit, user_id) =>
                 all_async(
-                    `select * from ${sm} where project=$1 order by created_at desc limit $2`,
-                    [project, limit],
+                    `select summary.* from ${sm} summary where summary.project=$1${user_id ? ` and exists (select 1 from ${s} session where session.id=summary.session_id and session.project=summary.project and session.user_id=$3)` : ""} order by summary.created_at desc, summary.id desc limit $2`,
+                    user_id ? [project, limit, user_id] : [project, limit],
                 ),
         },
         ins_user: {
@@ -718,92 +755,94 @@ if (is_pg) {
         );
     });
     memories_table = "memories";
-    const exec = (sql: string, p: any[] = []) =>
+    const context = new AsyncLocalStorage<{ active: boolean }>();
+    let pending: Promise<unknown> = Promise.resolve();
+    let broken: Error | undefined;
+    const exclusive = <T>(work: () => Promise<T>): Promise<T> => {
+        const result = pending.then(() => {
+            if (broken) throw broken;
+            return work();
+        });
+        pending = result.catch(() => {});
+        return result;
+    };
+    const query = <T>(work: () => Promise<T>): Promise<T> => {
+        const scope = context.getStore();
+        if (!scope) return exclusive(work);
+        if (!scope.active)
+            return Promise.reject(
+                new Error("Transaction callback has already finished"),
+            );
+        return work();
+    };
+    const execute = (sql: string, p: any[] = []) =>
         new Promise<void>((ok, no) =>
             db.run(sql, p, (err) => (err ? no(err) : ok())),
         );
+    const exec = (sql: string, p: any[] = []) => query(() => execute(sql, p));
     const one = (sql: string, p: any[] = []) =>
-        new Promise<any>((ok, no) =>
-            db.get(sql, p, (err, row) => (err ? no(err) : ok(row))),
+        query(
+            () =>
+                new Promise<any>((ok, no) =>
+                    db.get(sql, p, (err, row) => (err ? no(err) : ok(row))),
+                ),
         );
     const many = (sql: string, p: any[] = []) =>
-        new Promise<any[]>((ok, no) =>
-            db.all(sql, p, (err, rows) => (err ? no(err) : ok(rows))),
+        query(
+            () =>
+                new Promise<any[]>((ok, no) =>
+                    db.all(sql, p, (err, rows) => (err ? no(err) : ok(rows))),
+                ),
         );
     run_async = exec;
     get_async = one;
     all_async = many;
 
-
-
-
-
-
-
-
-
-
-
-
     if (env.vector_backend === "valkey") {
         vector_store = new ValkeyVectorStore(scoped_memory_ids);
         console.error("[DB] Using Valkey VectorStore");
     } else {
-        vector_store = new PostgresVectorStore({ run_async, get_async, all_async }, sqlite_vector_table);
-        console.error(`[DB] Using SQLite VectorStore with table: ${sqlite_vector_table}`);
+        vector_store = new PostgresVectorStore(
+            { run_async, get_async, all_async },
+            sqlite_vector_table,
+        );
+        console.error(
+            `[DB] Using SQLite VectorStore with table: ${sqlite_vector_table}`,
+        );
     }
-
-
-    class Mutex {
-        private mutex = Promise.resolve();
-        lock(): Promise<() => void> {
-            let unlock: (value?: void) => void = () => { };
-            const willUnlock = new Promise<void>(resolve => {
-                unlock = resolve;
-            });
-            const willAcquire = this.mutex.then(() => unlock);
-            this.mutex = this.mutex.then(() => willUnlock);
-            return willAcquire;
-        }
-    }
-    const txLock = new Mutex();
-    let releaseTx: (() => void) | null = null;
 
     transaction = {
-        begin: async () => {
-            /*
-            if (releaseTx) {
-
-                throw new Error("Transaction already active via lock");
-            }
-            */
-            const release = await txLock.lock();
-            releaseTx = release;
-            try {
-                await exec("BEGIN TRANSACTION");
-            } catch (e) {
-                releaseTx();
-                releaseTx = null;
-                throw e;
-            }
-        },
-        commit: async () => {
-            if (!releaseTx) return;
-            try {
-                await exec("COMMIT");
-            } finally {
-                releaseTx();
-                releaseTx = null;
-            }
-        },
-        rollback: async () => {
-            if (!releaseTx) return;
-            try {
-                await exec("ROLLBACK");
-            } finally {
-                releaseTx();
-                releaseTx = null;
-            }
+        run: async (work) => {
+            if (context.getStore())
+                throw new Error("Nested transactions are not supported");
+            return exclusive(() => {
+                const scope = { active: true };
+                return context.run(scope, async () => {
+                    let begun = false;
+                    try {
+                        await execute("BEGIN TRANSACTION");
+                        begun = true;
+                        const result = await work();
+                        scope.active = false;
+                        await execute("COMMIT");
+                        return result;
+                    } catch (error) {
+                        scope.active = false;
+                        if (begun) {
+                            try {
+                                await execute("ROLLBACK");
+                            } catch {
+                                broken = new Error(
+                                    "SQLite rollback failed; reopen the database before further queries",
+                                );
+                            }
+                        }
+                        throw error;
+                    } finally {
+                        scope.active = false;
+                    }
+                });
+            });
         },
     };
     q = {
@@ -829,12 +868,12 @@ if (is_pg) {
         },
         upd_feedback: {
             run: (...p) =>
-                exec("update memories set feedback_score=? where id=?", p),
+                exec("update memories set feedback_score=?2 where id=?1", p),
         },
         upd_seen: {
             run: (...p) =>
                 exec(
-                    "update memories set last_seen_at=?,salience=?,updated_at=? where id=?",
+                    "update memories set last_seen_at=?2,salience=?3,updated_at=?4 where id=?1",
                     p,
                 ),
         },
@@ -864,11 +903,7 @@ if (is_pg) {
                 ),
         },
         all_mem: {
-            all: (limit, offset) =>
-                many(
-                    "select * from memories order by created_at desc limit ? offset ?",
-                    [limit, offset],
-                ),
+            all: list_memories,
         },
         all_mem_by_sector: {
             all: (sector, limit, offset) =>
@@ -915,14 +950,14 @@ if (is_pg) {
         get_neighbors: {
             all: (src) =>
                 many(
-                    "select dst_id,weight from waypoints where src_id=? order by weight desc",
+                    "select edge.dst_id,edge.weight from waypoints edge join memories source on source.id=edge.src_id join memories target on target.id=edge.dst_id where edge.src_id=? and source.user_id is target.user_id and source.project is target.project order by edge.weight desc",
                     [src],
                 ),
         },
         get_waypoints_by_src: {
             all: (src) =>
                 many(
-                    "select src_id,dst_id,weight,created_at,updated_at from waypoints where src_id=?",
+                    "select edge.src_id,edge.dst_id,edge.weight,edge.created_at,edge.updated_at from waypoints edge join memories source on source.id=edge.src_id join memories target on target.id=edge.dst_id where edge.src_id=? and source.user_id is target.user_id and source.project is target.project",
                     [src],
                 ),
         },
@@ -1018,7 +1053,7 @@ if (is_pg) {
         ins_session: {
             run: (...p) =>
                 exec(
-                    "insert or replace into sessions(id,project,started_at,user_id) values(?,?,?,?)",
+                    "insert into sessions(id,project,started_at,user_id) values(?,?,?,?) on conflict(id) do nothing",
                     p,
                 ),
         },
@@ -1036,10 +1071,10 @@ if (is_pg) {
                 ),
         },
         get_summaries_by_project: {
-            all: (project, limit) =>
+            all: (project, limit, user_id) =>
                 many(
-                    "select * from summaries where project=? order by created_at desc limit ?",
-                    [project, limit],
+                    `select summary.* from summaries summary where summary.project=?${user_id ? " and exists (select 1 from sessions session where session.id=summary.session_id and session.project=summary.project and session.user_id=?)" : ""} order by summary.created_at desc, summary.id desc limit ?`,
+                    user_id ? [project, user_id, limit] : [project, limit],
                 ),
         },
         ins_user: {
@@ -1056,7 +1091,7 @@ if (is_pg) {
         upd_user_summary: {
             run: (...p) =>
                 exec(
-                    "update users set summary=?,reflection_count=reflection_count+1,updated_at=? where user_id=?",
+                    "update users set summary=?2,reflection_count=reflection_count+1,updated_at=?3 where user_id=?1",
                     p,
                 ),
         },

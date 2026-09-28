@@ -3,11 +3,7 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'packages/openmemory-js/**'
-      - 'packages/openmemory-py/**'
+  # Merging code is not authorization to publish packages.
   workflow_dispatch:
 
 jobs:

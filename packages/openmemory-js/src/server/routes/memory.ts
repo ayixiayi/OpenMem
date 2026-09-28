@@ -146,17 +146,11 @@ export function mem(app: any) {
             const s = req.query.sector;
             const user_id = req.query.user_id;
 
-            let r;
-            if (user_id) {
-
-                r = await q.all_mem_by_user.all(user_id, l, u);
-            } else if (s) {
-
-                r = await q.all_mem_by_sector.all(s, l, u);
-            } else {
-
-                r = await q.all_mem.all(l, u);
-            }
+            const r = await q.all_mem.all(l, u, {
+                user_id,
+                sector: s,
+                project: req.query.project,
+            });
 
             const i = r.map((x: any) => ({
                 id: x.id,

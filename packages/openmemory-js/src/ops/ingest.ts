@@ -37,18 +37,21 @@ const split = (t: string, sz: number): string[] => {
 const mkRoot = async (
     txt: string,
     ex: ExtractionResult,
+    sections: number,
     meta?: Record<string, unknown>,
     user_id?: string | null,
 ) => {
     const sum = txt.length > 500 ? txt.slice(0, 500) + "..." : txt;
-    const cnt = `[Document: ${ex.metadata.content_type.toUpperCase()}]\n\n${sum}\n\n[Full content split across ${Math.ceil(txt.length / SEC)} sections]`;
+    const cnt = `[Document: ${ex.metadata.content_type.toUpperCase()}]\n\n${sum}\n\n[Full content split across ${sections} sections]`;
     const id = rid(),
         ts = now();
-    await transaction.begin();
-    try {
+    return transaction.run(async () => {
         await q.ins_mem.run(
             id,
+            user_id || "anonymous",
+            0,
             cnt,
+            null,
             "reflective",
             j([]),
             j({
@@ -64,16 +67,19 @@ const mkRoot = async (
             1.0,
             0.1,
             1,
-            user_id || "anonymous",
             null,
+            null,
+            null,
+            0,
+            "default",
+            null,
+            "observation",
         );
-        await transaction.commit();
         return id;
-    } catch (e) {
+    }).catch((e) => {
         console.error("[ERROR] Root failed:", e);
-        await transaction.rollback();
         throw e;
-    }
+    });
 };
 
 const mkChild = async (
@@ -106,15 +112,14 @@ const link = async (
     user_id?: string | null,
 ) => {
     const ts = now();
-    await transaction.begin();
     try {
-        await q.ins_waypoint.run(rid, cid, user_id || "anonymous", 1.0, ts, ts);
-        await transaction.commit();
+        await transaction.run(async () => {
+            await q.ins_waypoint.run(rid, cid, user_id || "anonymous", 1.0, ts, ts);
+        });
         console.log(
             `[INGEST] Linked: ${rid.slice(0, 8)} -> ${cid.slice(0, 8)} (section ${idx})`,
         );
     } catch (e) {
-        await transaction.rollback();
         console.error(`[INGEST] Link failed for section ${idx}:`, e);
         throw e;
     }
@@ -162,7 +167,7 @@ export async function ingestDocument(
     const cids: string[] = [];
 
     try {
-        rid = await mkRoot(text, ex, meta, user_id);
+        rid = await mkRoot(text, ex, secs.length, meta, user_id);
         console.log(`[INGEST] Root memory created: ${rid}`);
         for (let i = 0; i < secs.length; i++) {
             try {
@@ -244,7 +249,7 @@ export async function ingestURL(
     const cids: string[] = [];
 
     try {
-        rid = await mkRoot(ex.text, ex, { ...meta, source_url: url }, user_id);
+        rid = await mkRoot(ex.text, ex, secs.length, { ...meta, source_url: url }, user_id);
         console.log(`[INGEST] Root memory for URL: ${rid}`);
         for (let i = 0; i < secs.length; i++) {
             try {

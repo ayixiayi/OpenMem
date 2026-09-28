@@ -68,8 +68,9 @@ npm install
 # Start development server
 npm run dev
 
-# Run Omnibus Test (Comprehensive Parity Check)
-npx tsx tests/test_omnibus.ts
+# Run type checking and isolated offline regressions
+npx tsc --noEmit
+npm test
 ```
 
 ### Python SDK Development
@@ -81,8 +82,8 @@ cd packages/openmemory-py
 # Install development dependencies
 pip install -e .[dev]
 
-# Run Omnibus Test
-pytest tests/test_omnibus.py
+# Run offline regressions against disposable data
+OM_DB_URL=sqlite:///:memory: OM_EMBED_KIND=synthetic python -m pytest tests -q
 ```
 
 

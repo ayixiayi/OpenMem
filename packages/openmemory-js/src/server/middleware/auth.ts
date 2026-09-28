@@ -20,16 +20,18 @@ const auth_config = {
 };
 
 function is_public_endpoint(path: string): boolean {
+    const pathname = path.split("?")[0];
     return auth_config.public_endpoints.some(
-        (e) => path === e || path.startsWith(e),
+        (e) => pathname === e || pathname === `${e}/`,
     );
 }
 
 function extract_api_key(req: any): string | null {
     const x_api_key = req.headers[auth_config.api_key_header];
-    if (x_api_key) return x_api_key;
+    if (x_api_key !== undefined)
+        return typeof x_api_key === "string" ? x_api_key : null;
     const auth_header = req.headers["authorization"];
-    if (auth_header) {
+    if (typeof auth_header === "string") {
         if (auth_header.startsWith("Bearer ")) return auth_header.slice(7);
         if (auth_header.startsWith("ApiKey ")) return auth_header.slice(7);
     }
@@ -37,9 +39,13 @@ function extract_api_key(req: any): string | null {
 }
 
 function validate_api_key(provided: string, expected: string): boolean {
-    if (!provided || !expected || provided.length !== expected.length)
-        return false;
-    return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+    if (!provided || !expected) return false;
+    const actual = Buffer.from(provided);
+    const wanted = Buffer.from(expected);
+    return (
+        actual.length === wanted.length &&
+        crypto.timingSafeEqual(actual, wanted)
+    );
 }
 
 function check_rate_limit(client_id: string): {

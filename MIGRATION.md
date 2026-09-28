@@ -233,5 +233,125 @@ require matching stored user and project on both endpoints, including for
 unscoped queries. Existing cross-scope edges remain stored but are not followed
 or reinforced. NULL scopes are not silently equated with named defaults.
 Unscoped vector retrieval still searches all scopes. These are data boundaries,
-not caller authorization; summaries, wakeup and temporal authorization require
+not caller authorization; caller identity and temporal authorization require
 separate work. Run `npx tsx tests/test_scope.ts` for the offline regression suite.
+
+## JS session ownership and scoped wakeup
+
+`openmemory_summarize` accepts an optional `user_id`. Session IDs remain globally
+unique: the first summary establishes the session's project and owner, and
+later summaries must match both. Reusing a session no longer overwrites its
+owner, project, start time or end time. An omitted owner creates an unowned
+(NULL-owned) session; existing unowned sessions cannot silently acquire an
+owner. Clients that previously reused session IDs across users or projects must
+generate distinct IDs. Session creation and summary insertion share a transaction.
+
+`openmemory_wakeup` accepts an optional `user_id`. When supplied, it filters
+memories and summaries before their respective limits. Summary ownership is
+resolved through the existing session and matching project, so orphan summaries
+and project-mismatched legacy rows are excluded from user-scoped results.
+Omitting `user_id` preserves project-wide reads, including other users' records.
+The optional `identity.txt` remains service-instance-wide shared text, even for
+user-scoped wakeup; do not store private per-user identity there. A caller-provided
+user ID is a filter, not authentication or permission to access that user's data.
+
+No schema migration, historical ownership assignment or database rebuild is
+required. JS and Python databases remain separate contracts, not interchangeable
+stores. Run `npx tsx tests/test_sessions.ts` for the in-memory SQLite MCP regression
+suite. Its rollback and concurrent ownership checks do not establish PostgreSQL
+session integration behavior; the PostgreSQL transaction tests below cover the
+connection lifecycle separately.
+
+## JS PostgreSQL transaction connections
+
+Internal database callers now use `transaction.run(async () => { ... })` instead
+of separate begin/commit/rollback calls. The supported HTTP/MCP interfaces and
+database schema are unchanged. Code importing the internal `core/db` transaction
+object directly must migrate to the callback form and await all database work
+inside it; nested PostgreSQL transactions are rejected rather than implicitly
+joining an outer transaction.
+
+Each PostgreSQL callback owns a connection through asynchronous context storage.
+Other callbacks use their own connections, and queries outside a callback use
+the pool rather than joining whichever transaction is currently active. Failed
+transactions roll back; uncertain or broken connections are discarded. Work
+that retains a finished transaction context is rejected instead of querying a
+released connection. A failed COMMIT can have an unknown server-side outcome;
+the helper does not automatically retry writes.
+
+This does not add serializable isolation, deduplication uniqueness constraints,
+or distributed transactions with Valkey. Read-then-write business races still
+need explicit constraints or locking. SQLite retains its existing single
+connection but now queues ordinary queries and transaction callbacks through
+the same gate. Only queries belonging to the active callback can run inside its
+transaction. Nested callbacks and expired transaction contexts are rejected;
+a failed rollback blocks further queries until the database is reopened.
+
+From `packages/openmemory-js`, run:
+
+```sh
+npx tsx tests/test_postgres_transactions.ts
+OM_TEST_PG_SOCKET=/tmp/your-disposable-pg/socket npx tsx tests/test_postgres_transactions_integration.ts
+```
+
+The integration test requires a disposable local PostgreSQL server on Unix
+socket port 55439, database `postgres`, and local trust-authenticated role
+`om_test`. It deliberately does not consume application connection settings.
+It creates and drops a uniquely named test table. PostgreSQL 15.19 was used to
+verify distinct connection IDs, concurrent commit/rollback isolation, SQL-error
+rollback and recovery. This tests the transaction helper, not full application
+initialization, pgvector operations, or every business-level concurrency rule.
+
+## Write contracts, scoped tools and regression gates
+
+SQLite salience/last-seen and feedback updates now bind arguments in the same
+ID-first order as PostgreSQL. Previously these calls could update no row (or an
+unintended numeric-looking ID). Existing timestamps and scores are not repaired
+automatically; future reinforcement, decay and feedback writes now take effect.
+The feedback field still reflects retrieval scoring, not independently observed
+task success or a learned utility signal.
+
+SQLite user-summary updates also use the caller's ID-first contract. PostgreSQL
+compressed-vector and embedding-log updates now match their callers' value-first
+contracts. Named TypeScript parameters protect these interfaces from order drift.
+
+MCP `openmemory_list` and HTTP `GET /memory/all` now combine user, project and
+sector filters before pagination. The HTTP endpoint accepts optional `project`;
+its existing `l` (limit) and `u` (offset) parameters are unchanged. MCP
+`openmemory_timeline` and `openmemory_consolidate` accept optional `user_id`.
+Timeline checks the anchor's ownership and filters surrounding rows before
+limits; consolidation applies the same scope to both counts and candidates.
+Omitting the user filter preserves project-wide behavior. Consolidation only
+returns recommendations; it does not automatically merge or delete records.
+
+Root-child ingestion now supplies all memory columns in the correct order and
+reports the actual split count, including custom section sizes. Root metadata,
+ownership and sector no longer shift into unrelated columns. This does not
+make an entire document import atomic or redesign document membership: repeated
+sections may still be deduplicated, and waypoint storage still permits only one
+outgoing edge per `(src_id,user_id)`. Do not interpret waypoints as a complete
+document-to-section index.
+
+Two data-model gaps were reproduced in disposable SQLite during this audit:
+importing the same two-section document twice reports two children on the second
+import but leaves both child records attached to the first root; inserting the
+same temporal fact and valid-from timestamp for another user fails the existing
+tenant-independent unique constraint. Fixing these requires explicit membership
+and uniqueness migrations, not silently reassigning historical records. Neither
+gap is covered up by the passing regression suites or repaired on startup.
+
+Neighbor and outgoing-waypoint queries now enforce matching stored user/project
+at the DAO boundary as well as in HSG traversal. This also protects dynamics
+reinforcement from historical cross-scope links. Such links remain stored.
+
+Authentication still uses an optional shared administrative API key, not a
+tenant identity. Public endpoint matching is now exact (with an optional trailing
+slash/query), malformed header values are rejected, and non-ASCII key inputs
+cannot cause byte-length comparison exceptions. Deploy behind a trusted boundary;
+omitting the API key still preserves the legacy unauthenticated mode.
+
+`npm test` in `packages/openmemory-js` runs eight offline suites with an isolated
+temporary home, in-memory SQLite and synthetic embeddings. CI runs this command
+and type checking, plus the Python regression directory. Real PostgreSQL
+integration remains a separate opt-in test. Package publishing is now a manual
+workflow; pushing or merging main no longer triggers npm/PyPI publication.

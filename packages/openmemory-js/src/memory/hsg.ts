@@ -1091,15 +1091,13 @@ export async function add_hsg_memory(
     const use_chunking = chunks.length > 1;
     const classification = classify_content(content, metadata);
     const all_sectors = [classification.primary, ...classification.additional];
-    await transaction.begin();
-    try {
+    return transaction.run(async () => {
         const existing = await q.get_mem_by_simhash.get(
             simhash, user_id || "anonymous", project ?? "default",
         );
         if (existing && hamming_dist(simhash, existing.simhash) <= 3) {
             const boosted_sal = Math.min(1, existing.salience + 0.15);
             await q.upd_seen.run(existing.id, now, boosted_sal, now);
-            await transaction.commit();
             return {
                 id: existing.id,
                 primary_sector: existing.primary_sector,
@@ -1178,32 +1176,23 @@ export async function add_hsg_memory(
         }
 
         await create_single_waypoint(id, mean_vec, now, user_id);
-        await transaction.commit();
         return {
             id,
             primary_sector: classification.primary,
             sectors: all_sectors,
             chunks: chunks.length,
         };
-    } catch (error) {
-        await transaction.rollback();
-        throw error;
-    }
+    });
 }
 export async function delete_memory(id: string): Promise<boolean> {
     const mem = await q.get_mem.get(id);
     if (!mem) return false;
-    await transaction.begin();
-    try {
+    return transaction.run(async () => {
         await q.del_mem.run(id);
         await q.del_waypoints.run(id, id);
         await vector_store.deleteVectors(id);
-        await transaction.commit();
         return true;
-    } catch (error) {
-        await transaction.rollback();
-        throw error;
-    }
+    });
 }
 export async function reinforce_memory(
     id: string,
@@ -1226,8 +1215,7 @@ export async function update_memory(
     const new_content = content !== undefined ? content : mem.content;
     const new_tags = tags !== undefined ? j(tags) : mem.tags || "[]";
     const new_meta = metadata !== undefined ? j(metadata) : mem.meta || "{}";
-    await transaction.begin();
-    try {
+    return transaction.run(async () => {
         if (content !== undefined && content !== mem.content) {
             const chunks = chunk_text(new_content);
             const use_chunking = chunks.length > 1;
@@ -1272,10 +1260,6 @@ export async function update_memory(
                 id,
             );
         }
-        await transaction.commit();
         return { id, updated: true };
-    } catch (error) {
-        await transaction.rollback();
-        throw error;
-    }
+    });
 }

@@ -11,15 +11,7 @@ export const insert_fact = async (
     metadata?: Record<string, any>,
     user_id?: string
 ): Promise<string> => {
-    await transaction.begin()
-    try {
-        const id = await insert_fact_in_transaction(subject, predicate, object, valid_from, confidence, metadata, user_id)
-        await transaction.commit()
-        return id
-    } catch (error) {
-        await transaction.rollback()
-        throw error
-    }
+    return transaction.run(() => insert_fact_in_transaction(subject, predicate, object, valid_from, confidence, metadata, user_id))
 }
 
 const insert_fact_in_transaction = async (
@@ -128,8 +120,7 @@ export const batch_insert_facts = async (facts: Array<{
 }>, user_id?: string): Promise<string[]> => {
     const ids: string[] = []
 
-    await transaction.begin()
-    try {
+    await transaction.run(async () => {
         for (const fact of facts) {
             const id = await insert_fact_in_transaction(
                 fact.subject,
@@ -142,12 +133,8 @@ export const batch_insert_facts = async (facts: Array<{
             )
             ids.push(id)
         }
-        await transaction.commit()
-        console.log(`[TEMPORAL] Batch inserted ${ids.length} facts`)
-    } catch (error) {
-        await transaction.rollback()
-        throw error
-    }
+    })
+    console.log(`[TEMPORAL] Batch inserted ${ids.length} facts`)
 
     return ids
 }

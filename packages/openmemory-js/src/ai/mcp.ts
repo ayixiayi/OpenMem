@@ -11,7 +11,7 @@ import {
     delete_memory,
     sector_configs,
 } from "../memory/hsg";
-import { q, all_async, memories_table, vector_store } from "../core/db";
+import { q, all_async, memories_table, vector_store, transaction } from "../core/db";
 import { getEmbeddingInfo } from "../memory/embed";
 import { j, p } from "../utils";
 import type { sector_type, mem_row, rpc_err_code } from "../core/types";
@@ -583,30 +583,7 @@ export const create_mcp_srv = () => {
         async ({ limit, sector, user_id, project }) => {
             const u = uid(user_id);
             const proj = project?.trim() || undefined;
-            let rows: mem_row[];
-            if (u) {
-                const all = await q.all_mem_by_user.all(u, limit ?? 10, 0);
-                rows = all.filter(
-                    (row) =>
-                        (!sector || row.primary_sector === sector) &&
-                        (!proj || (row as any).project === proj),
-                );
-            } else {
-                if (proj) {
-                    const scoped = await q.all_mem_by_project.all(
-                        proj,
-                        limit ?? 10,
-                        0,
-                    );
-                    rows = sector
-                        ? scoped.filter((row) => row.primary_sector === sector)
-                        : scoped;
-                } else {
-                    rows = sector
-                        ? await q.all_mem_by_sector.all(sector, limit ?? 10, 0)
-                        : await q.all_mem.all(limit ?? 10, 0);
-                }
-            }
+            const rows: mem_row[] = await q.all_mem.all(limit ?? 10, 0, { user_id: u, project: proj, sector });
             const items = rows.map((row) => ({
                 ...build_mem_snap(row),
                 tags: p(row.tags || "[]") as string[],
@@ -633,6 +610,7 @@ export const create_mcp_srv = () => {
         "Persist a summary of work completed in a session.",
         {
             session_id: z.string().min(1).describe("Session identifier"),
+            user_id: z.string().trim().min(1).optional().describe("Session owner; omit for an unowned session"),
             project: z
                 .string()
                 .min(1)
@@ -647,25 +625,29 @@ export const create_mcp_srv = () => {
                 .describe("List of modified file paths"),
         },
         async (args) => {
-            const existing = await q.get_session.get(args.session_id);
-            if (!existing) {
+            const user_id = uid(args.user_id) ?? null;
+            await transaction.run(async () => {
                 await q.ins_session.run(
                     args.session_id,
                     args.project,
                     Date.now(),
-                    null,
+                    user_id,
                 );
-            }
-            await q.ins_summary.run(
-                args.session_id,
-                args.project,
-                args.request,
-                args.completed,
-                args.learned,
-                args.next_steps || null,
-                args.files_modified ? JSON.stringify(args.files_modified) : null,
-                Date.now(),
-            );
+                const session = await q.get_session.get(args.session_id);
+                if (session.project !== args.project || session.user_id !== user_id) {
+                    throw new Error("Session belongs to a different user or project");
+                }
+                await q.ins_summary.run(
+                    args.session_id,
+                    args.project,
+                    args.request,
+                    args.completed,
+                    args.learned,
+                    args.next_steps || null,
+                    args.files_modified ? JSON.stringify(args.files_modified) : null,
+                    Date.now(),
+                );
+            });
             return {
                 content: [
                     {
@@ -682,6 +664,7 @@ export const create_mcp_srv = () => {
         "Get surrounding observations around an anchor memory for chronological context.",
         {
             memory_id: z.string().min(1).describe("Anchor memory ID"),
+            user_id: z.string().trim().min(1).optional().describe("Restrict the anchor and surrounding memories to this user"),
             depth_before: z
                 .number()
                 .int()
@@ -698,8 +681,9 @@ export const create_mcp_srv = () => {
                 .describe("Number of memories after the anchor"),
         },
         async (args) => {
+            const user_id = uid(args.user_id);
             const anchor = await q.get_mem.get(args.memory_id);
-            if (!anchor) {
+            if (!anchor || (user_id && anchor.user_id !== user_id)) {
                 return {
                     content: [
                         {
@@ -714,15 +698,15 @@ export const create_mcp_srv = () => {
             const project = (anchor as any).project || "default";
             const created = Number((anchor as any).created_at || 0);
 
-            const before = await q.timeline_before.all(
-                project,
-                created,
-                args.depth_before,
+            const scope = user_id ? " and user_id=?" : "";
+            const params = user_id ? [project, created, user_id] : [project, created];
+            const before = await all_async(
+                `select * from ${memories_table} where project=? and created_at<?${scope} order by created_at desc,id desc limit ?`,
+                [...params, args.depth_before],
             );
-            const after = await q.timeline_after.all(
-                project,
-                created,
-                args.depth_after,
+            const after = await all_async(
+                `select * from ${memories_table} where project=? and created_at>?${scope} order by created_at asc,id asc limit ?`,
+                [...params, args.depth_after],
             );
 
             const timeline = [...before.reverse(), anchor, ...after];
@@ -803,6 +787,7 @@ export const create_mcp_srv = () => {
         "Check if a project's memories need consolidation and return the lowest-value candidates for merging. Call this periodically to prevent memory bloat. The agent should review the candidates, synthesize them into fewer high-quality memories via openmemory_store, then delete the originals via openmemory_delete.",
         {
             project: z.string().trim().min(1).describe("Project to check for consolidation"),
+            user_id: z.string().trim().min(1).optional().describe("Restrict counts and candidates to this user; omit for the whole project"),
             threshold: z
                 .number()
                 .int()
@@ -819,8 +804,11 @@ export const create_mcp_srv = () => {
                 .describe("Number of lowest-salience candidates to return (default 10)"),
         },
         async (args) => {
-            const count_row = await q.count_by_project.get(args.project);
-            const total = count_row?.c ?? 0;
+            const user_id = uid(args.user_id);
+            const scope = `project=?${user_id ? " and user_id=?" : ""}`;
+            const params = user_id ? [args.project, user_id] : [args.project];
+            const count_rows = await all_async(`select count(*) as c from ${memories_table} where ${scope}`, params);
+            const total = Number(count_rows[0]?.c ?? 0);
 
             if (total <= (args.threshold ?? 50)) {
                 return {
@@ -836,9 +824,9 @@ export const create_mcp_srv = () => {
                 };
             }
 
-            const candidates = await q.get_oldest_by_project.all(
-                args.project,
-                args.candidate_count ?? 10,
+            const candidates = await all_async(
+                `select id,content,observation_type,primary_sector,salience,tags,meta,created_at from ${memories_table} where ${scope} order by salience asc,created_at asc,id asc limit ?`,
+                [...params, args.candidate_count ?? 10],
             );
 
             const formatted = candidates.map((c: any) => ({
@@ -947,6 +935,7 @@ export const create_mcp_srv = () => {
         "openmemory_wakeup",
         "Load compressed project context for session start. Returns identity + top memories + recent summaries in a single call (~200 tokens). Call this ONCE at the beginning of every session.",
         {
+            user_id: z.string().trim().min(1).optional().describe("Restrict memories and summaries to this user; omit for project-wide context"),
             project: z
                 .string()
                 .trim()
@@ -960,8 +949,9 @@ export const create_mcp_srv = () => {
                 .default(15)
                 .describe("Max memories to include in essential story (default 15)"),
         },
-        async (args: { project: string; limit?: number }) => {
+        async (args: { project: string; limit?: number; user_id?: string }) => {
             const limit = args.limit ?? 15;
+            const user_id = uid(args.user_id);
             const max_chars = 3200;
 
             // L0: Identity (static, optional)
@@ -978,8 +968,8 @@ export const create_mcp_srv = () => {
 
             // L1: Top-N memories by salience, project-scoped
             const top_memories = await all_async(
-                `select id, content, observation_type, primary_sector, salience, project from ${memories_table} where project=? order by salience desc, created_at desc limit ?`,
-                [args.project, limit],
+                `select id, content, observation_type, primary_sector, salience, project from ${memories_table} where project=?${user_id ? " and user_id=?" : ""} order by salience desc, created_at desc limit ?`,
+                user_id ? [args.project, user_id, limit] : [args.project, limit],
             );
 
             // Group by observation_type, truncate to budget
@@ -1004,9 +994,8 @@ export const create_mcp_srv = () => {
             }
 
             // L1.5: Recent summaries
-            const recent_summaries = await all_async(
-                `select request, completed, learned, next_steps, created_at from summaries where project=? order by created_at desc limit 3`,
-                [args.project],
+            const recent_summaries = await q.get_summaries_by_project.all(
+                args.project, 3, user_id,
             );
 
             let summary_text = "";
