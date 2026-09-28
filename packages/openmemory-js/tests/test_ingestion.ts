@@ -47,6 +47,15 @@ async function main() {
     }
     assert.match(children[0].content, /Apples/);
     assert.match(children[1].content, /Submarines/);
+    const repeated = await ingestDocument("text", "Apples grow on trees in orchards.\n\nSubmarines explore the deepest ocean.", { source: "second" }, { force_root: true, sec_sz: 40 }, "alice");
+    const membership = await q.get_document_sections.all(repeated.root_memory_id);
+    assert.deepEqual(membership.map(row => [row.section_index, row.id]), children.map((row, index) => [index, row.id]));
+    assert.equal((await q.get_document_sections.all(root.id)).length, 2);
+    assert.equal(JSON.parse((await q.get_mem.get(children[0].id)).meta).parent_id, root.id);
+    await q.del_mem.run(root.id);
+    assert.equal((await q.get_document_sections.all(root.id)).length, 0);
+    assert.equal((await q.get_document_sections.all(repeated.root_memory_id)).length, 2);
+    assert.ok(await q.get_mem.get(children[0].id));
     console.log(
         "[INGESTION] root field bindings, actual section count and child metadata passed",
     );

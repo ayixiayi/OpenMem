@@ -327,18 +327,18 @@ returns recommendations; it does not automatically merge or delete records.
 Root-child ingestion now supplies all memory columns in the correct order and
 reports the actual split count, including custom section sizes. Root metadata,
 ownership and sector no longer shift into unrelated columns. This does not
-make an entire document import atomic or redesign document membership: repeated
-sections may still be deduplicated, and waypoint storage still permits only one
+make an entire document import atomic. Repeated sections may still be
+deduplicated, and JS waypoint storage still permits only one
 outgoing edge per `(src_id,user_id)`. Do not interpret waypoints as a complete
-document-to-section index.
+document-to-section index; the new membership table described below serves that role.
 
 Two data-model gaps were reproduced in disposable SQLite during this audit:
 importing the same two-section document twice reports two children on the second
 import but leaves both child records attached to the first root; inserting the
 same temporal fact and valid-from timestamp for another user fails the existing
-tenant-independent unique constraint. Fixing these requires explicit membership
-and uniqueness migrations, not silently reassigning historical records. Neither
-gap is covered up by the passing regression suites or repaired on startup.
+tenant-independent unique constraint. The explicit membership and uniqueness
+migrations below address future writes and recoverable legacy relationships;
+they do not silently reassign historical records.
 
 Neighbor and outgoing-waypoint queries now enforce matching stored user/project
 at the DAO boundary as well as in HSG traversal. This also protects dynamics
@@ -350,8 +350,93 @@ slash/query), malformed header values are rejected, and non-ASCII key inputs
 cannot cause byte-length comparison exceptions. Deploy behind a trusted boundary;
 omitting the API key still preserves the legacy unauthenticated mode.
 
-`npm test` in `packages/openmemory-js` runs eight offline suites with an isolated
+`npm test` in `packages/openmemory-js` runs nine offline suites with an isolated
 temporary home, in-memory SQLite and synthetic embeddings. CI runs this command
 and type checking, plus the Python regression directory. Real PostgreSQL
 integration remains a separate opt-in test. Package publishing is now a manual
 workflow; pushing or merging main no longer triggers npm/PyPI publication.
+
+## Compatible document membership and temporal identity upgrade
+
+On database initialization JS now applies migration 1, recorded in
+`_om_migrations`. Python applies `003_document_sections.sql`, recorded in its
+existing `_migrations` table. These are separate engines and migration histories;
+neither database is interchangeable with the other. The old v1.2 instructions
+above are not a replacement for these migrations.
+
+Both engines add `document_sections(document_id, section_index, memory_id)`.
+Each document position has one memory, while the same memory can belong to
+multiple documents. Import writes membership and the legacy waypoint together
+in a transaction. The internal `get_document_sections` DAO returns ordered
+sections whose endpoints have matching stored ownership (and project in JS).
+No new public HTTP/MCP endpoint is introduced. Deleting a root removes its
+memberships, not shared child memories. Deleting a child removes its memberships.
+SQLite deletion triggers enforce this even with legacy foreign keys disabled.
+Whole-document ingestion is still not atomic.
+
+Backfill accepts only explicit root/child flags, a nonnegative integer section
+index, an existing distinct parent and matching scopes. Conflicting candidates
+for a position and malformed metadata are skipped. Existing metadata, IDs and
+content are unchanged. Relationships already lost to historical deduplication
+cannot be recovered without the original source. Python deduplication now
+matches the stored user; omitted users keep the `anonymous` default, not NULL.
+
+JS replaces the global temporal identity constraint with two partial unique
+indexes: named users include `user_id` in identity; NULL-owned facts retain the
+legacy four-field uniqueness. Same-user duplicates are still rejected. Python's
+original schema has no such global constraint and is not rebuilt or tightened.
+
+JS SQLite rebuilds only the recognized SDK temporal table, preserving explicit
+indexes, triggers and fact/edge data. A customized table definition fails the
+upgrade rather than discarding extra columns or constraints. PostgreSQL removes
+only the known four-column unique constraint. Schema changes, backfill and the
+marker commit together; PostgreSQL serializes migrations with an advisory lock.
+This lock does not make all application bootstrap operations concurrency-safe.
+
+Before upgrading a persistent installation, stop all writers, take a consistent
+backup (SQLite backup API or PostgreSQL database backup), and test the upgrade
+on a copy. Do not run old and new writers together: old writers cannot maintain
+membership and may recreate assumptions about global fact identity. JS startup
+requires schema-alter privileges; migration errors block normal DAO operations.
+If migration fails, fix the cause and restart; do not delete markers. To roll
+back a successful upgrade, restore the backup and old package together. Dropping
+the new indexes or table is not a safe downgrade after new writes. Backfill reads
+legacy memory metadata; large-database time and memory costs are not benchmarked.
+
+Verification commands (package-local):
+
+```sh
+# JS: offline SQLite migration preservation, failure rollback, repeatability,
+# ingestion membership and the existing compatibility suites.
+npm test
+npx tsc --noEmit
+# Opt-in, disposable PostgreSQL only; no pgvector is required for this test.
+OM_TEST_PG_SOCKET=/tmp/your-disposable-pg/socket npx tsx tests/test_schema_migrations_postgres.ts
+# Python: disposable fixtures plus the existing offline suite.
+OM_DB_URL=sqlite:///:memory: OM_EMBED_KIND=synthetic python -m pytest -q tests
+```
+
+The PostgreSQL test uses port 55439, role `om_test` and database `postgres`,
+creates a unique schema and drops it afterward. It verifies injected-failure
+rollback, concurrent migration calls, backfill, NULL/named-user uniqueness and
+cascade deletion. It does not verify full pgvector initialization or Valkey.
+
+## Remaining embedding compatibility boundary
+
+Vectors still have no persisted actual-provider/model/transform provenance.
+Historical vectors must remain explicitly unknown; configured model names,
+dimensions, memory `version` and `embed_logs.model='multi-sector'` do not prove
+which embedding space produced them. JS can fall back to another provider or
+synthetic vectors, and simple batch, smart fusion and query paths are not yet
+a single contract. Python has a different embedding implementation.
+
+The next compatible change should record actual generation provenance for new
+vectors before introducing filtering: provider, requested model identifier,
+observed dimensions and a versioned transform identifier (including fusion and
+chunk aggregation). Provider model aliases do not prove immutable model weights.
+Preserve float-array public APIs through explicit internal result objects, not
+global mutable "last provider" state. Legacy unknown vectors must not be relabeled
+or silently excluded. A strict retrieval mode or re-embedding rollout needs
+separate evaluation and an explicit migration decision. Tests must distinguish
+same-dimensional different models, provider fallback, batch/query transforms,
+mixed chunk spaces, retry partial results and cache invalidation.

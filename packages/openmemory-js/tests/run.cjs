@@ -12,6 +12,7 @@ try {
         "test_sqlite_transactions",
         "test_postgres_transactions",
         "test_ingestion",
+        "test_schema_migrations",
         "test_auth",
         "test_omnibus",
     ]) {
@@ -44,7 +45,7 @@ try {
             );
         }
     }
-    console.log("[REGRESSION] All 8 offline suites passed");
+    console.log("[REGRESSION] All 9 offline suites passed");
 } finally {
     rmSync(home, { recursive: true, force: true });
 }

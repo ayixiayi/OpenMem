@@ -131,6 +131,9 @@ class Queries:
     def get_waypoints_by_src(self, src_id: str):
         return db.fetchall("SELECT * FROM waypoints WHERE src_id=?", (src_id,))
 
+    def get_document_sections(self, document_id: str):
+        return db.fetchall("SELECT section.section_index, child.* FROM document_sections section JOIN memories root ON root.id=section.document_id JOIN memories child ON child.id=section.memory_id WHERE section.document_id=? AND root.user_id IS child.user_id ORDER BY section.section_index", (document_id,))
+
     def del_mem(self, mid: str):
         db.execute("DELETE FROM memories WHERE id=?", (mid,))
         db.execute("DELETE FROM vectors WHERE id=?", (mid,))

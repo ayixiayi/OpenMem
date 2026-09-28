@@ -56,7 +56,7 @@ def test_legacy_upgrade_preserves_data_and_is_repeatable(connection):
     assert (edge["source_id"], edge["target_id"], edge["weight"]) == ("old", "old", 0.4)
     db.run_migrations()
     assert dict(db.fetchone("SELECT * FROM temporal_edges")) == edge
-    assert db.fetchone("SELECT count(*) AS n FROM _migrations")["n"] == 2
+    assert db.fetchone("SELECT count(*) AS n FROM _migrations")["n"] == 3
 
 
 def test_migration_failure_rolls_back_schema_and_marker(

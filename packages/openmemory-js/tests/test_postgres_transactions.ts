@@ -127,7 +127,7 @@ async function main() {
         return { rows: [] };
     }) as any;
     Pool.prototype.connect = (async () => {
-        throw new Error("DAO test must not connect");
+        return { query: Pool.prototype.query, release() {} };
     }) as any;
     try {
         const { q, all_async } = await import("../src/core/db");

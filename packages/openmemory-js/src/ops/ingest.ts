@@ -114,6 +114,7 @@ const link = async (
     const ts = now();
     try {
         await transaction.run(async () => {
+            await q.ins_document_section.run(rid, idx, cid);
             await q.ins_waypoint.run(rid, cid, user_id || "anonymous", 1.0, ts, ts);
         });
         console.log(

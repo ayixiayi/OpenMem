@@ -2,6 +2,7 @@ import sqlite3 from "sqlite3";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Pool } from "pg";
 import { postgres_transactions } from "./postgres_transaction";
+import { migrate_sqlite, migrate_postgres } from "./schema_migrations";
 import { env } from "./cfg";
 import fs from "node:fs";
 import path from "node:path";
@@ -97,6 +98,8 @@ type q_type = {
     get_session: { get: (id: string) => Promise<any> };
     end_session: { run: (...p: any[]) => Promise<void> };
     ins_summary: { run: (...p: any[]) => Promise<void> };
+    ins_document_section: { run: (document_id: string, index: number, memory_id: string) => Promise<void> };
+    get_document_sections: { all: (document_id: string) => Promise<any[]> };
     get_summaries_by_project: {
         all: (
             project: string,
@@ -331,6 +334,7 @@ if (is_pg) {
         await pg.query(
             `create index if not exists openmemory_stats_type_idx on "${sc}"."stats"(type)`,
         );
+        await migrate_postgres(pg, sc, m);
         ready = true;
 
 
@@ -588,6 +592,12 @@ if (is_pg) {
                     user_id ? [project, limit, user_id] : [project, limit],
                 ),
         },
+        ins_document_section: {
+            run: (document_id, index, memory_id) => run_async(`insert into "${sc}"."document_sections"(document_id,section_index,memory_id) values($1,$2,$3) on conflict(document_id,section_index) do update set memory_id=excluded.memory_id`, [document_id, index, memory_id]),
+        },
+        get_document_sections: {
+            all: (document_id) => all_async(`select section.section_index,child.* from "${sc}"."document_sections" section join ${m} root on root.id=section.document_id join ${m} child on child.id=section.memory_id where section.document_id=$1 and root.user_id is not distinct from child.user_id and root.project is not distinct from child.project order by section.section_index`, [document_id]),
+        },
         ins_user: {
             run: (...p) =>
                 run_async(
@@ -755,11 +765,14 @@ if (is_pg) {
         );
     });
     memories_table = "memories";
+    const schema_ready = migrate_sqlite(db);
+    void schema_ready.catch(() => {});
     const context = new AsyncLocalStorage<{ active: boolean }>();
     let pending: Promise<unknown> = Promise.resolve();
     let broken: Error | undefined;
     const exclusive = <T>(work: () => Promise<T>): Promise<T> => {
-        const result = pending.then(() => {
+        const result = pending.then(async () => {
+            await schema_ready;
             if (broken) throw broken;
             return work();
         });
@@ -1076,6 +1089,12 @@ if (is_pg) {
                     `select summary.* from summaries summary where summary.project=?${user_id ? " and exists (select 1 from sessions session where session.id=summary.session_id and session.project=summary.project and session.user_id=?)" : ""} order by summary.created_at desc, summary.id desc limit ?`,
                     user_id ? [project, user_id, limit] : [project, limit],
                 ),
+        },
+        ins_document_section: {
+            run: (document_id, index, memory_id) => exec("insert into document_sections(document_id,section_index,memory_id) values(?,?,?) on conflict(document_id,section_index) do update set memory_id=excluded.memory_id", [document_id, index, memory_id]),
+        },
+        get_document_sections: {
+            all: (document_id) => many("select section.section_index,child.* from document_sections section join memories root on root.id=section.document_id join memories child on child.id=section.memory_id where section.document_id=? and root.user_id is child.user_id and root.project is child.project order by section.section_index", [document_id]),
         },
         ins_user: {
             run: (...p) =>

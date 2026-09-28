@@ -28,17 +28,17 @@ def split_text(t: str, sz: int) -> list[str]:
     if cur.strip(): secs.append(cur.strip())
     return secs
 
-async def mk_root(txt: str, ex: Dict, meta: Dict = None, user_id: str = None) -> str:
+async def mk_root(txt: str, ex: Dict, meta: Dict = None, user_id: str = None, sections: Optional[int] = None) -> str:
     summ = txt[:500] + "..." if len(txt) > 500 else txt
     ctype = ex["metadata"]["content_type"].upper()
-    sec_count = int(len(txt) / SEC) + 1
+    sec_count = sections if sections is not None else len(split_text(txt, SEC))
     content = f"[Document: {ctype}]\n\n{summ}\n\n[Full content split across {sec_count} sections]"
 
     mid = str(uuid.uuid4())
     ts = int(time.time()*1000)
 
     try:
-        full_meta = meta or {}
+        full_meta = dict(meta or {})
         full_meta.update(ex["metadata"])
         full_meta.update({
             "is_root": True,
@@ -66,7 +66,7 @@ async def mk_root(txt: str, ex: Dict, meta: Dict = None, user_id: str = None) ->
         raise e
 
 async def mk_child(txt: str, idx: int, tot: int, rid: str, meta: Dict = None, user_id: str = None) -> str:
-    m = meta or {}
+    m = dict(meta or {})
     m.update({
         "is_child": True,
         "section_index": idx,
@@ -78,9 +78,15 @@ async def mk_child(txt: str, idx: int, tot: int, rid: str, meta: Dict = None, us
 
 async def link(rid: str, cid: str, idx: int, user_id: str = None):
     ts = int(time.time()*1000)
-    db.execute("INSERT INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?)",
-               (rid, cid, user_id or "anonymous", 1.0, ts, ts))
-    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("INSERT INTO document_sections(document_id,section_index,memory_id) VALUES (?,?,?) ON CONFLICT(document_id,section_index) DO UPDATE SET memory_id=excluded.memory_id", (rid, idx, cid))
+        db.execute("INSERT INTO waypoints(src_id,dst_id,user_id,weight,created_at,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(src_id,dst_id) DO UPDATE SET weight=excluded.weight,updated_at=excluded.updated_at",
+                   (rid, cid, user_id or "anonymous", 1.0, ts, ts))
+        db.commit()
+    except Exception:
+        db.conn.rollback()
+        raise
 
 async def ingest_document(t: str, data: Any, meta: Dict = None, cfg: Dict = None, user_id: str = None, tags: list = None) -> Dict[str, Any]:
     th = cfg.get("lg_thresh", LG) if cfg else LG
@@ -95,7 +101,7 @@ async def ingest_document(t: str, data: Any, meta: Dict = None, cfg: Dict = None
     tags_json = json.dumps(tags or [])
 
     if not use_rc:
-        m = meta or {}
+        m = dict(meta or {})
         m.update(exMeta)
         m.update({"ingestion_strategy": "single", "ingested_at": int(time.time()*1000)})
 
@@ -113,7 +119,7 @@ async def ingest_document(t: str, data: Any, meta: Dict = None, cfg: Dict = None
 
     cids = []
     try:
-        rid_val = await mk_root(text, ex, meta, user_id)
+        rid_val = await mk_root(text, ex, meta, user_id, sections=len(secs))
         for i, s in enumerate(secs):
              cid = await mk_child(s, i, len(secs), rid_val, meta, user_id)
              cids.append(cid)
@@ -142,7 +148,7 @@ async def ingest_url(url: str, meta: Dict = None, cfg: Dict = None, user_id: str
     use_rc = (cfg and cfg.get("force_root")) or ex["metadata"]["estimated_tokens"] > th
 
     if not use_rc:
-        m = meta or {}
+        m = dict(meta or {})
         m.update(ex["metadata"])
         m.update({"ingestion_strategy": "single", "ingested_at": int(time.time()*1000)})
         r = await add_hsg_memory(ex["text"], json.dumps([]), m, user_id)
@@ -157,11 +163,11 @@ async def ingest_url(url: str, meta: Dict = None, cfg: Dict = None, user_id: str
     secs = split_text(ex["text"], sz)
     cids = []
 
-    m_root = meta or {}
+    m_root = dict(meta or {})
     m_root["source_url"] = url
 
     try:
-        rid_val = await mk_root(ex["text"], ex, m_root, user_id)
+        rid_val = await mk_root(ex["text"], ex, m_root, user_id, sections=len(secs))
         for i, s in enumerate(secs):
              cid = await mk_child(s, i, len(secs), rid_val, m_root, user_id)
              cids.append(cid)
