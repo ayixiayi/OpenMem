@@ -1,5 +1,5 @@
 
-import { add_hsg_memory, hsg_query } from "../memory/hsg";
+import { add_hsg_memory, hsg_query, delete_memory } from "../memory/hsg";
 import { q, log_maint_op } from "./db";
 import { env } from "./cfg";
 import { j } from "../utils";
@@ -55,15 +55,21 @@ export class Memory {
     async delete_all(user_id?: string) {
         const uid = user_id || this.default_user;
         if (uid) {
-
-
-
+            while (true) {
+                const rows = await q.all_mem_by_user.all(uid, 100, 0);
+                if (!rows.length) break;
+                for (const row of rows) await delete_memory(row.id);
+            }
         }
     }
 
     async wipe() {
         console.log("[Memory] Wiping DB...");
-
+        while (true) {
+            const rows = await q.all_mem.all(100, 0);
+            if (!rows.length) break;
+            for (const row of rows) await delete_memory(row.id);
+        }
         await q.clear_all.run();
     }
 

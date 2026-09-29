@@ -5,20 +5,22 @@ import sqlite3
 import struct
 from .db import db, DB
 from .types import MemRow
+from .embedding_contract import validate_vector, validate_provenance
 import logging
 
 logger = logging.getLogger("vector_store")
 
 class VectorRow:
-    def __init__(self, id: str, sector: str, vector: List[float], dim: int):
+    def __init__(self, id: str, sector: str, vector: List[float], dim: int, provenance: Optional[Dict[str, Any]] = None):
         self.id = id
         self.sector = sector
         self.vector = vector
         self.dim = dim
+        self.provenance = provenance
 
 class VectorStore(ABC):
     @abstractmethod
-    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None): pass
+    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None, provenance: Optional[Dict[str, Any]] = None): pass
 
     @abstractmethod
     async def getVectorsById(self, id: str) -> List[VectorRow]: pass
@@ -36,10 +38,12 @@ class SQLiteVectorStore(VectorStore):
     def __init__(self, table_name: str = "vectors"):
         self.table = table_name
 
-    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None):
+    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None, provenance: Optional[Dict[str, Any]] = None):
+        validate_vector(vector, dim)
+        validate_provenance(provenance, sector, dim)
         blob = struct.pack(f"{len(vector)}f", *vector)
-        sql = f"INSERT OR REPLACE INTO {self.table}(id, sector, user_id, v, dim) VALUES (?, ?, ?, ?, ?)"
-        db.conn.execute(sql, (id, sector, user_id, blob, dim))
+        sql = f"INSERT OR REPLACE INTO {self.table}(id, sector, user_id, v, dim, provenance) VALUES (?, ?, ?, ?, ?, ?)"
+        db.conn.execute(sql, (id, sector, user_id, blob, dim, json.dumps(provenance) if provenance is not None else None))
         db.commit()
 
     async def getVectorsById(self, id: str) -> List[VectorRow]:
@@ -49,7 +53,7 @@ class SQLiteVectorStore(VectorStore):
         for r in rows:
             cnt = len(r["v"]) // 4
             vec = list(struct.unpack(f"{cnt}f", r["v"]))
-            res.append(VectorRow(r["id"], r["sector"], vec, r["dim"]))
+            res.append(VectorRow(r["id"], r["sector"], vec, r["dim"], json.loads(r["provenance"]) if r["provenance"] else None))
         return res
 
     async def getVector(self, id: str, sector: str) -> Optional[VectorRow]:
@@ -58,13 +62,14 @@ class SQLiteVectorStore(VectorStore):
         if not r: return None
         cnt = len(r["v"]) // 4
         vec = list(struct.unpack(f"{cnt}f", r["v"]))
-        return VectorRow(r["id"], r["sector"], vec, r["dim"])
+        return VectorRow(r["id"], r["sector"], vec, r["dim"], json.loads(r["provenance"]) if r["provenance"] else None)
 
     async def deleteVectors(self, id: str):
         db.conn.execute(f"DELETE FROM {self.table} WHERE id=?", (id,))
         db.commit()
 
     async def search(self, vector: List[float], sector: str, k: int, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        validate_vector(vector, len(vector))
         filter_sql = ""
         params = [sector]
         if filter and filter.get("user_id"):
@@ -80,6 +85,7 @@ class SQLiteVectorStore(VectorStore):
 
         for r in rows:
             cnt = len(r["v"]) // 4
+            if cnt != len(vector): continue
             v = np.array(struct.unpack(f"{cnt}f", r["v"]), dtype=np.float32)
             dot = np.dot(query_vec, v)
             norm = np.linalg.norm(v)
@@ -95,13 +101,13 @@ def get_vector_store() -> VectorStore:
     if backend == "postgres":
         dsn = os.getenv("OPENMEMORY_PG_DSN", "postgresql://user:pass@localhost:5432/db")
         from .vector.postgres import PostgresVectorStore
-        logger.info(f"Using PostgresVectorStore at {dsn}")
+        logger.info("Using PostgresVectorStore")
         return PostgresVectorStore(dsn)
 
     elif backend == "valkey" or backend == "redis":
         url = os.getenv("OPENMEMORY_REDIS_URL", "redis://localhost:6379/0")
         from .vector.valkey import ValkeyVectorStore
-        logger.info(f"Using ValkeyVectorStore at {url}")
+        logger.info("Using ValkeyVectorStore")
         return ValkeyVectorStore(url)
 
     else:

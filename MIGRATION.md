@@ -350,7 +350,7 @@ slash/query), malformed header values are rejected, and non-ASCII key inputs
 cannot cause byte-length comparison exceptions. Deploy behind a trusted boundary;
 omitting the API key still preserves the legacy unauthenticated mode.
 
-`npm test` in `packages/openmemory-js` runs nine offline suites with an isolated
+`npm test` in `packages/openmemory-js` runs thirteen offline suites with an isolated
 temporary home, in-memory SQLite and synthetic embeddings. CI runs this command
 and type checking, plus the Python regression directory. Real PostgreSQL
 integration remains a separate opt-in test. Package publishing is now a manual
@@ -421,22 +421,77 @@ creates a unique schema and drops it afterward. It verifies injected-failure
 rollback, concurrent migration calls, backfill, NULL/named-user uniqueness and
 cascade deletion. It does not verify full pgvector initialization or Valkey.
 
-## Remaining embedding compatibility boundary
+## Embedding provenance and backend compatibility
 
-Vectors still have no persisted actual-provider/model/transform provenance.
-Historical vectors must remain explicitly unknown; configured model names,
-dimensions, memory `version` and `embed_logs.model='multi-sector'` do not prove
-which embedding space produced them. JS can fall back to another provider or
-synthetic vectors, and simple batch, smart fusion and query paths are not yet
-a single contract. Python has a different embedding implementation.
+JS migration 2 and Python migration 004 add nullable vector `provenance`.
+New HSG writes record schema version, actual successful provider, requested model,
+sector, observed dimensions and a versioned transform. JS composite transforms
+also record their sources. Float-array embedding APIs remain available; legacy
+store calls explicitly replace provenance with NULL rather than retaining stale
+identity. Existing vectors remain unknown and are not relabeled or re-embedded.
+JS local embeddings are labeled as hash placeholders, not loaded model weights.
+Provider aliases are not immutable model identifiers, and these separate engines
+still do not share an embedding space or database format.
 
-The next compatible change should record actual generation provenance for new
-vectors before introducing filtering: provider, requested model identifier,
-observed dimensions and a versioned transform identifier (including fusion and
-chunk aggregation). Provider model aliases do not prove immutable model weights.
-Preserve float-array public APIs through explicit internal result objects, not
-global mutable "last provider" state. Legacy unknown vectors must not be relabeled
-or silently excluded. A strict retrieval mode or re-embedding rollout needs
-separate evaluation and an explicit migration decision. Tests must distinguish
-same-dimensional different models, provider fallback, batch/query transforms,
-mixed chunk spaces, retry partial results and cache invalidation.
+Writes reject empty, non-finite/Float32-overflowing and dimension-mismatched vectors.
+Search and sector fusion skip incompatible dimensions before ranking. This does
+not enforce same-model compatibility for equal-dimensional vectors: a strict
+retrieval policy and historical re-embedding require evaluation and a rollout plan.
+JS query generation now follows the document mode policy; indexed batches restore
+sector order, retries do not accumulate partial results, and chunk averaging
+rejects different identified spaces.
+
+Python PostgreSQL upgrades the recognized legacy single-ID primary key to
+`(id,sector)` under a transaction/advisory lock, preserving rows. Unknown primary
+keys fail closed. Both engines stop creating an invalid dimensionless HNSW index;
+exact search works with mixed dimensions, while operator-managed indexes are left
+untouched. Large-database search performance has not been benchmarked. Install
+Python backends with `pip install 'openmemory-py[postgres]'` or `[valkey]`.
+
+Python Redis/Valkey writes use encoded v2 per-sector keys. Legacy keys stay
+readable; the new key wins for a replaced sector. Deletion covers both formats.
+Old writers/readers must not run alongside this upgrade: old readers cannot see
+all new sectors. JS keeps its existing key layout and fixes binary vector reads.
+Back up external vectors as well as metadata before migration; restoring only one
+store cannot roll back a multi-store installation.
+
+Additional opt-in verification (disposable PostgreSQL with pgvector, port 55439,
+role `om_test`, database `postgres`; disposable Redis on port 56379):
+
+```sh
+# JS package directory
+OM_TEST_PG_SOCKET=/tmp/your-disposable-pg/socket OM_TEST_REDIS_PORT=56379 npx tsx tests/test_vector_backends_integration.ts
+# Python package directory, with dev/postgres/valkey extras installed
+OM_DB_URL=sqlite:///:memory: OM_EMBED_KIND=synthetic OM_TEST_PG_SOCKET=/tmp/your-disposable-pg/socket OM_TEST_REDIS_PORT=56379 python -m pytest -q tests
+```
+
+Tests use unique namespaces and remove them. Real PostgreSQL/pgvector bootstrap,
+legacy upgrade, binary Redis roundtrip, multi-sector preservation, provenance and
+negative-cosine dimension filtering were exercised. Redis without a search module
+validates the scan fallback, not actual FT.SEARCH execution. Live embedding services
+and production-sized datasets remain untested.
+
+## Fresh reads, deletion and non-destructive decay
+
+Whole-query result caches are removed in both engines. A per-process cache clear
+would not cover other workers or low-level writers. Repeated queries now perform
+retrieval again, trading latency for current metadata/content and no stale cached
+deletions; this is not a serializable snapshot guarantee during concurrent writes.
+Python waypoint traversal and associative reinforcement exclude cross-user edges
+before spending the expansion budget. Historical cross-user links are not deleted.
+
+Public deletion cleans the configured vector backend before metadata. JS HTTP
+routes use the common deletion path; SDK bulk deletion processes every page and
+keeps other users intact. External failure leaves metadata available for retry.
+Bulk deletion can partially succeed, and multiple stores still have no distributed
+transaction. Stop writers for a full wipe; this is not a concurrent-write erasure
+protocol, and historical orphaned external vectors are not automatically repaired.
+
+Decay no longer selects absent summary/coactivation columns. It keeps searchable
+source vectors, ownership and provenance intact, placing pooled derivatives only
+in the existing `compressed_vec` field. Synthetic fingerprints no longer replace
+primary search vectors. Zero salience is not mistaken for a missing default.
+This intentionally favors retrievability over vector-storage savings; derived
+compression is not used as a same-space retrieval vector. Existing compressed or
+unknown vectors are not silently reconstructed. This is not a new forgetting-policy
+or ranking-quality evaluation; the existing salience model remains otherwise intact.

@@ -5,6 +5,7 @@ import {
     hsg_query,
     reinforce_memory,
     update_memory,
+    delete_memory,
 } from "../../memory/hsg";
 import { ingestDocument, ingestURL } from "../../ops/ingest";
 import { env } from "../../core/cfg";
@@ -218,9 +219,7 @@ export function mem(app: any) {
                 return res.status(403).json({ err: "forbidden" });
             }
 
-            await q.del_mem.run(id);
-            await vector_store.deleteVectors(id);
-            await q.del_waypoints.run(id, id);
+            await delete_memory(id);
             res.json({ ok: true });
         } catch (e: any) {
             res.status(500).json({ err: "internal" });

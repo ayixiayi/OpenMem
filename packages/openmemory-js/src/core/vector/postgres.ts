@@ -1,4 +1,5 @@
-import { VectorStore } from "../vector_store";
+import { VectorStore, StoredEmbedding } from "../vector_store";
+import { EmbeddingProvenance, validateVector, validateProvenance } from "../embedding_contract";
 import { bufferToVector, vectorToBuffer, cosineSimilarity } from "../../memory/embed";
 
 export interface DbOps {
@@ -17,16 +18,18 @@ export class PostgresVectorStore implements VectorStore {
         console.error(`[PostgresVectorStore] mode: ${usePgVector ? 'pgvector (native)' : 'sqlite (compat)'}`);
     }
 
-    async storeVector(id: string, sector: string, vector: number[], dim: number, user_id?: string): Promise<void> {
+    async storeVector(id: string, sector: string, vector: number[], dim: number, user_id?: string, provenance: EmbeddingProvenance | null = null): Promise<void> {
+        validateVector(vector, dim);
+        validateProvenance(provenance, sector, dim);
         console.error(`[Vector] Storing ID: ${id}, Sector: ${sector}, Dim: ${dim}`);
         if (this.usePgVector) {
             const v_str = JSON.stringify(vector);
-            const sql = `insert into ${this.table}(id,sector,user_id,v,dim) values($1,$2,$3,$4::vector,$5) on conflict(id,sector) do update set user_id=excluded.user_id,v=excluded.v,dim=excluded.dim`;
-            await this.db.run_async(sql, [id, sector, user_id || "anonymous", v_str, dim]);
+            const sql = `insert into ${this.table}(id,sector,user_id,v,dim,provenance) values($1,$2,$3,$4::vector,$5,$6) on conflict(id,sector) do update set user_id=excluded.user_id,v=excluded.v,dim=excluded.dim,provenance=excluded.provenance`;
+            await this.db.run_async(sql, [id, sector, user_id || "anonymous", v_str, dim, provenance ? JSON.stringify(provenance) : null]);
         } else {
             const v = vectorToBuffer(vector);
-            const sql = `insert into ${this.table}(id,sector,user_id,v,dim) values($1,$2,$3,$4,$5) on conflict(id,sector) do update set user_id=excluded.user_id,v=excluded.v,dim=excluded.dim`;
-            await this.db.run_async(sql, [id, sector, user_id || "anonymous", v, dim]);
+            const sql = `insert into ${this.table}(id,sector,user_id,v,dim,provenance) values($1,$2,$3,$4,$5,$6) on conflict(id,sector) do update set user_id=excluded.user_id,v=excluded.v,dim=excluded.dim,provenance=excluded.provenance`;
+            await this.db.run_async(sql, [id, sector, user_id || "anonymous", v, dim, provenance ? JSON.stringify(provenance) : null]);
         }
     }
 
@@ -39,9 +42,10 @@ export class PostgresVectorStore implements VectorStore {
     }
 
     async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
+        validateVector(queryVec, queryVec.length);
         if (this.usePgVector) {
             const v_str = JSON.stringify(queryVec);
-            let filter_sql = "where sector = $2";
+            let filter_sql = "where sector = $2 and vector_dims(v)=vector_dims($1::vector)";
             const args: any[] = [v_str, sector, topK];
 
             if (user_id) {
@@ -83,6 +87,7 @@ export class PostgresVectorStore implements VectorStore {
             const sims: Array<{ id: string; score: number }> = [];
             for (const row of rows) {
                 const vec = bufferToVector(row.v);
+                if (vec.length !== queryVec.length) continue;
                 const sim = cosineSimilarity(queryVec, vec);
                 sims.push({ id: row.id, score: sim });
             }
@@ -91,35 +96,35 @@ export class PostgresVectorStore implements VectorStore {
         }
     }
 
-    async getVector(id: string, sector: string): Promise<{ vector: number[]; dim: number } | null> {
+    async getVector(id: string, sector: string): Promise<StoredEmbedding | null> {
         if (this.usePgVector) {
-            const row = await this.db.get_async(`select v::text as v_txt,dim from ${this.table} where id=$1 and sector=$2`, [id, sector]);
+            const row = await this.db.get_async(`select v::text as v_txt,dim,provenance from ${this.table} where id=$1 and sector=$2`, [id, sector]);
             if (!row) return null;
-            return { vector: JSON.parse(row.v_txt), dim: row.dim };
+            return { vector: JSON.parse(row.v_txt), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null };
         } else {
-            const row = await this.db.get_async(`select v,dim from ${this.table} where id=$1 and sector=$2`, [id, sector]);
+            const row = await this.db.get_async(`select v,dim,provenance from ${this.table} where id=$1 and sector=$2`, [id, sector]);
             if (!row) return null;
-            return { vector: bufferToVector(row.v), dim: row.dim };
+            return { vector: bufferToVector(row.v), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null };
         }
     }
 
-    async getVectorsById(id: string): Promise<Array<{ sector: string; vector: number[]; dim: number }>> {
+    async getVectorsById(id: string): Promise<Array<StoredEmbedding & { sector: string }>> {
         if (this.usePgVector) {
-            const rows = await this.db.all_async(`select sector,v::text as v_txt,dim from ${this.table} where id=$1`, [id]);
-            return rows.map(row => ({ sector: row.sector, vector: JSON.parse(row.v_txt), dim: row.dim }));
+            const rows = await this.db.all_async(`select sector,v::text as v_txt,dim,provenance from ${this.table} where id=$1`, [id]);
+            return rows.map(row => ({ sector: row.sector, vector: JSON.parse(row.v_txt), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null }));
         } else {
-            const rows = await this.db.all_async(`select sector,v,dim from ${this.table} where id=$1`, [id]);
-            return rows.map(row => ({ sector: row.sector, vector: bufferToVector(row.v), dim: row.dim }));
+            const rows = await this.db.all_async(`select sector,v,dim,provenance from ${this.table} where id=$1`, [id]);
+            return rows.map(row => ({ sector: row.sector, vector: bufferToVector(row.v), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null }));
         }
     }
 
-    async getVectorsBySector(sector: string): Promise<Array<{ id: string; vector: number[]; dim: number }>> {
+    async getVectorsBySector(sector: string): Promise<Array<StoredEmbedding & { id: string }>> {
         if (this.usePgVector) {
-            const rows = await this.db.all_async(`select id,v::text as v_txt,dim from ${this.table} where sector=$1`, [sector]);
-            return rows.map(row => ({ id: row.id, vector: JSON.parse(row.v_txt), dim: row.dim }));
+            const rows = await this.db.all_async(`select id,v::text as v_txt,dim,provenance from ${this.table} where sector=$1`, [sector]);
+            return rows.map(row => ({ id: row.id, vector: JSON.parse(row.v_txt), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null }));
         } else {
-            const rows = await this.db.all_async(`select id,v,dim from ${this.table} where sector=$1`, [sector]);
-            return rows.map(row => ({ id: row.id, vector: bufferToVector(row.v), dim: row.dim }));
+            const rows = await this.db.all_async(`select id,v,dim,provenance from ${this.table} where sector=$1`, [sector]);
+            return rows.map(row => ({ id: row.id, vector: bufferToVector(row.v), dim: row.dim, provenance: row.provenance ? JSON.parse(row.provenance) : null }));
         }
     }
 }

@@ -17,6 +17,8 @@ async function fixture() {
     await run(
         "create table memories(id text primary key,user_id text,project text,meta text)",
     );
+    await run("create table vectors(id text,sector text,v blob,dim integer)");
+    await run("insert into vectors values('legacy','semantic',x'0000803f',1)");
     await run(
         "create table temporal_facts(id text primary key,user_id text,subject text not null,predicate text not null,object text not null,valid_from integer not null,valid_to integer,confidence real not null check(confidence >= 0 and confidence <= 1),last_updated integer not null,metadata text,unique(subject,predicate,object,valid_from))",
     );
@@ -123,7 +125,14 @@ async function main() {
         );
         assert.deepEqual(await f.all("select * from _om_migrations"), [
             { version: 1 },
+            { version: 2 },
         ]);
+        assert.deepEqual(
+            await f.all(
+                "select id,hex(v) as bytes,dim,provenance from vectors",
+            ),
+            [{ id: "legacy", bytes: "0000803F", dim: 1, provenance: null }],
+        );
         await f.run(
             "update temporal_facts set last_updated=456 where id='original'",
         );

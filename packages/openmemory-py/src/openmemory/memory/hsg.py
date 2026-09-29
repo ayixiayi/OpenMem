@@ -16,7 +16,7 @@ from ..utils.text import canonical_token_set, canonical_tokens_from_text
 from ..utils.chunking import chunk_text
 from ..utils.keyword import keyword_filter_memories, compute_keyword_overlap
 from ..utils.vectors import buf_to_vec, vec_to_buf, cos_sim
-from .embed import embed_multi_sector, embed_for_sector, embed_multi_sector, calc_mean_vec
+from .embed import embed_multi_sector, embed_for_sector, embed_with_provenance, calc_mean_vec
 from .decay import inc_q, dec_q, on_query_hit, calc_recency_score as calc_recency_score_decay, pick_tier
 from ..ops.dynamics import (
     calculateCrossSectorResonanceScore,
@@ -366,7 +366,7 @@ async def calc_multi_vec_fusion_score(mid: str, qe: Dict[str, List[float]], w: D
 
     for v in vecs:
         qv = qe.get(v.sector)
-        if not qv: continue
+        if not qv or len(qv) != len(v.vector): continue
         sim = cos_sim(v.vector, qv)
         wgt = wm.get(v.sector, 0.5)
         s += sim * wgt
@@ -438,7 +438,7 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         )
         emb_res = await embed_multi_sector(mid, content, all_secs, chunks if use_chunks else None)
         for r in emb_res:
-             await store.storeVector(mid, r["sector"], r["vector"], r["dim"], user_id or "anonymous")
+             await store.storeVector(mid, r["sector"], r["vector"], r["dim"], user_id or "anonymous", r["provenance"])
 
         mean_vec = calc_mean_vec(emb_res, all_secs)
         mean_buf = vec_to_buf(mean_vec)
@@ -461,9 +461,6 @@ async def add_hsg_memory(content: str, tags: Optional[str] = None, metadata: Any
         }
     except Exception as e:
         raise e
-cache = {}
-TTL = 60000
-
 async def expand_via_waypoints(ids: List[str], max_exp: int = 10):
     exp = []
     vis = set(ids)
@@ -472,8 +469,9 @@ async def expand_via_waypoints(ids: List[str], max_exp: int = 10):
 
     while q_arr and cnt < max_exp:
         cur = q_arr.pop(0)
-        neighs = db.fetchall("SELECT dst_id, weight FROM waypoints WHERE src_id=? ORDER BY weight DESC", (cur["id"],))
+        neighs = db.fetchall("SELECT w.dst_id, w.weight FROM waypoints w JOIN memories src ON src.id=w.src_id JOIN memories dst ON dst.id=w.dst_id WHERE w.src_id=? AND src.user_id IS dst.user_id ORDER BY w.weight DESC", (cur["id"],))
         for n in neighs:
+            if cnt >= max_exp: break
             dst = n["dst_id"]
             if dst in vis: continue
             wt = min(1.0, max(0.0, float(n["weight"])))
@@ -489,13 +487,9 @@ async def expand_via_waypoints(ids: List[str], max_exp: int = 10):
 
 async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     start_q = time.time()
+    f = f or {}
     inc_q()
     try:
-        cache_key = f"{qt}:{k}:{json.dumps(f)}"
-        if cache_key in cache:
-            entry = cache[cache_key]
-            if time.time()*1000 - entry["t"] < TTL: return entry["r"]
-
         qc = classify_content(qt)
         qtk = canonical_token_set(qt)
 
@@ -607,7 +601,7 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
              now = int(time.time()*1000)
              db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (rsal, now, r["id"]))
              if len(r["path"]) > 1:
-                 wps_rows = db.fetchall("SELECT dst_id, weight FROM waypoints WHERE src_id=?", (r["id"],))
+                 wps_rows = db.fetchall("SELECT w.dst_id, w.weight FROM waypoints w JOIN memories src ON src.id=w.src_id JOIN memories dst ON dst.id=w.dst_id WHERE w.src_id=? AND src.user_id IS dst.user_id", (r["id"],))
                  wps = [{"target_id": row["dst_id"], "weight": row["weight"]} for row in wps_rows]
 
                  pru = await propagateAssociativeReinforcementToLinkedNodes(r["id"], rsal, wps)
@@ -620,9 +614,8 @@ async def hsg_query(qt: str, k: int = 10, f: Dict[str, Any] = None) -> List[Dict
                          new_sal = max(0.0, min(1.0, (linked_mem["salience"] or 0) + ctx_boost))
                          db.execute("UPDATE memories SET salience=?, last_seen_at=? WHERE id=?", (new_sal, now, u["node_id"]))
 
-             await on_query_hit(r["id"], r["primary_sector"], lambda t: embed_for_sector(t, r["primary_sector"]))
+             await on_query_hit(r["id"], r["primary_sector"], lambda t: embed_with_provenance(env.emb_kind or "synthetic", t, r["primary_sector"]))
 
-        cache[cache_key] = {"r": top, "t": time.time()*1000}
         return top
 
     finally:

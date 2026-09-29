@@ -18,12 +18,17 @@ async function main() {
     });
     const schema = `migration_test_${randomUUID().replaceAll("-", "")}`;
     const table = `"${schema}".memories`;
+    const vectors = `"${schema}".vectors`;
     const facts = `"${schema}".temporal_facts`;
     const root = randomUUID(),
         child = randomUUID(),
         fact = randomUUID();
     try {
         await pool.query(`create schema "${schema}"`);
+        await pool.query(`create table ${vectors}(id text,v bytea)`);
+        await pool.query(
+            `insert into ${vectors} values('legacy',decode('0000803f','hex'))`,
+        );
         await pool.query(
             `create table ${table}(id uuid primary key,user_id text,project text,meta text)`,
         );
@@ -52,7 +57,7 @@ async function main() {
             `create table "${schema}"._om_migrations(version integer primary key check(version<0))`,
         );
         await assert.rejects(
-            migrate_postgres(pool, schema, table),
+            migrate_postgres(pool, schema, table, vectors),
             /check constraint/,
         );
         assert.equal(
@@ -74,8 +79,8 @@ async function main() {
             `alter table "${schema}"._om_migrations drop constraint _om_migrations_version_check`,
         );
         await Promise.all([
-            migrate_postgres(pool, schema, table),
-            migrate_postgres(pool, schema, table),
+            migrate_postgres(pool, schema, table, vectors),
+            migrate_postgres(pool, schema, table, vectors),
         ]);
         assert.deepEqual(
             (await pool.query(`select * from "${schema}".document_sections`))
@@ -110,7 +115,15 @@ async function main() {
                     `select count(*)::integer as n from "${schema}"._om_migrations`,
                 )
             ).rows[0].n,
-            1,
+            2,
+        );
+        assert.deepEqual(
+            (
+                await pool.query(
+                    `select id,encode(v,'hex') as bytes,provenance from ${vectors}`,
+                )
+            ).rows,
+            [{ id: "legacy", bytes: "0000803f", provenance: null }],
         );
         await pool.query(`delete from ${table} where id=$1`, [root]);
         assert.deepEqual(

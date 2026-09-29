@@ -1,8 +1,6 @@
 import asyncio
 import time
 import math
-import json
-import hashlib
 from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
 import httpx
@@ -10,6 +8,7 @@ import httpx
 from ..core.config import env
 from ..core.models import get_model
 from ..core.db import q
+from ..core.embedding_contract import validate_vector
 from ..core.constants import SECTOR_CONFIGS, SEC_WTS
 from ..utils.text import canonical_tokens_from_text, synonyms_for, canonicalize_token
 from ..utils.vectors import vec_to_buf, buf_to_vec
@@ -22,20 +21,43 @@ from ..ai.synthetic import SyntheticAdapter
 from ..ai.minimax import MiniMaxAdapter
 
 async def emb_dispatch(provider: str, t: str, s: str) -> List[float]:
-    if provider == "synthetic":
-        return await SyntheticAdapter(env.vec_dim or 768).embed(t, model=s)
-    if provider == "openai":
-        return await OpenAIAdapter().embed(t, model=env.openai_model)
-    if provider == "ollama":
-        return await OllamaAdapter().embed(t, model=env.ollama_embedding_model)
-    if provider == "gemini":
-        return await GeminiAdapter().embed(t, model=env.gemini_embedding_model)
-    if provider == "aws":
-        return await AwsAdapter().embed(t, model=env.aws_embedding_model)
-    if provider == "minimax":
-        return await MiniMaxAdapter().embed(t, model=env.minimax_embedding_model)
+    return (await embed_with_provenance(provider, t, s))["vector"]
 
-    return await SyntheticAdapter(env.vec_dim or 768).embed(t, model=s)
+
+async def embed_with_provenance(provider: str, t: str, s: str) -> Dict[str, Any]:
+    transform = "identity-v1"
+    if provider == "openai":
+        adapter, model = OpenAIAdapter(), env.openai_model or "text-embedding-3-small"
+    elif provider == "ollama":
+        adapter, model = OllamaAdapter(), env.ollama_embedding_model or "nomic-embed-text"
+    elif provider == "gemini":
+        adapter, model = GeminiAdapter(), env.gemini_embedding_model or "models/text-embedding-004"
+        if "models/" not in model:
+            model = f"models/{model}"
+        transform = "identity-v1:SEMANTIC_SIMILARITY"
+    elif provider == "aws":
+        adapter, model = AwsAdapter(), env.aws_embedding_model or "amazon.titan-embed-text-v2:0"
+        transform = "provider-normalize-v1"
+    elif provider == "minimax":
+        adapter, model = MiniMaxAdapter(), env.minimax_embedding_model or "embo-01"
+        transform = "identity-v1:query"
+    else:
+        # Preserve the legacy unknown-provider fallback, recording what ran.
+        provider, model = "synthetic", "openmemory-py-synthetic-v1"
+        adapter = SyntheticAdapter(env.vec_dim or 768)
+    vector = await adapter.embed(t, model=s if provider == "synthetic" else model)
+    validate_vector(vector, len(vector) if vector is not None else 0)
+    return {
+        "vector": vector,
+        "provenance": {
+            "schema_version": 1,
+            "provider": provider,
+            "model": model,
+            "sector": s,
+            "dimensions": len(vector),
+            "transform": transform,
+        },
+    }
 
 async def embed_for_sector(t: str, s: str) -> List[float]:
     if s not in SECTOR_CONFIGS: raise Exception(f"Unknown sector: {s}")
@@ -48,8 +70,10 @@ async def embed_multi_sector(id: str, txt: str, secs: List[str], chunks: Optiona
     res = []
     try:
         for s in secs:
-            v = await embed_for_sector(txt, s)
-            res.append({"sector": s, "vector": v, "dim": len(v)})
+            if s not in SECTOR_CONFIGS:
+                raise ValueError(f"Unknown sector: {s}")
+            result = await embed_with_provenance(env.emb_kind or "synthetic", txt, s)
+            res.append({"sector": s, **result, "dim": len(result["vector"])})
 
         q.upd_log(id=id, status="completed", err=None)
         return res

@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict, Optional, Any
 from .core.db import db, q
+from .core.vector_store import vector_store
 from .memory.hsg import hsg_query, add_hsg_memory
 from .ops.ingest import ingest_document
 from .openai_handler import OpenAIRegistrar
@@ -34,12 +35,15 @@ class Memory:
         return q.get_mem(memory_id)
 
     async def delete(self, memory_id: str):
+        await vector_store.deleteVectors(memory_id)
         q.del_mem(memory_id)
 
     async def delete_all(self, user_id: str = None):
         uid = user_id or self.default_user
         if uid:
-            q.del_mem_by_user(uid)
+            while rows := q.all_mem_by_user(uid, 100, 0):
+                for row in rows:
+                    await self.delete(row["id"])
 
     def history(self, user_id: str = None, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         uid = user_id or self.default_user

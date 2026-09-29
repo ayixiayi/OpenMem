@@ -237,10 +237,8 @@ if (is_pg) {
         await pg.query(
             `create table if not exists ${v}(id uuid,sector text,user_id text,v vector,dim integer not null,primary key(id,sector))`,
         );
-        await pg.query(
-            `create index if not exists openmemory_vectors_hnsw_idx on ${v} using hnsw (v vector_cosine_ops)`,
-        );
-        console.error(`[DB] HNSW index created on ${v} for fast ANN queries`);
+        // Mixed-dimension vector columns cannot have an unqualified HNSW index.
+        // Keep exact search; dimension/model-specific ANN indexes need an explicit rollout.
         await pg.query(
             `create table if not exists ${w}(src_id text,dst_id text not null,user_id text,weight double precision not null,created_at bigint,updated_at bigint,primary key(src_id,user_id))`,
         );
@@ -334,7 +332,7 @@ if (is_pg) {
         await pg.query(
             `create index if not exists openmemory_stats_type_idx on "${sc}"."stats"(type)`,
         );
-        await migrate_postgres(pg, sc, m);
+        await migrate_postgres(pg, sc, m, v);
         ready = true;
 
 

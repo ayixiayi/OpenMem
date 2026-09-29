@@ -4,7 +4,9 @@ import json
 import logging
 import asyncio
 import numpy as np
+from urllib.parse import quote
 from ..vector_store import VectorStore, VectorRow
+from ..embedding_contract import validate_vector, validate_provenance
 
 logger = logging.getLogger("vector_store.valkey")
 
@@ -20,12 +22,23 @@ class ValkeyVectorStore(VectorStore):
             self.client = redis.from_url(self.url)
         return self.client
 
-    def _key(self, id: str) -> str:
-        return f"{self.prefix}{id}"
+    def _key(self, id: str, sector: Optional[str] = None) -> str:
+        if sector is None:
+            return f"{self.prefix}{id}"  # Legacy single-sector key remains readable.
+        return f"{self.prefix}v2:{quote(id, safe='')}:{quote(sector, safe='')}"
 
-    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None):
+    async def _keys(self, id: str):
         client = await self._get_client()
-        key = self._key(id)
+        keys = [self._key(id)]
+        async for key in client.scan_iter(match=f"{self.prefix}v2:{quote(id, safe='')}:*", count=100):
+            keys.append(key)
+        return keys
+
+    async def storeVector(self, id: str, sector: str, vector: List[float], dim: int, user_id: Optional[str] = None, provenance: Optional[Dict[str, Any]] = None):
+        validate_vector(vector, dim)
+        validate_provenance(provenance, sector, dim)
+        client = await self._get_client()
+        key = self._key(id, sector)
         vec_bytes = np.array(vector, dtype=np.float32).tobytes()
 
         mapping = {
@@ -33,26 +46,26 @@ class ValkeyVectorStore(VectorStore):
             "sector": sector,
             "dim": dim,
             "v": vec_bytes,
-            "user_id": user_id or ""
+            "user_id": user_id or "",
+            "provenance": json.dumps(provenance)
         }
         await client.hset(key, mapping=mapping)
 
     async def getVectorsById(self, id: str) -> List[VectorRow]:
         client = await self._get_client()
-        key = self._key(id)
-        data = await client.hgetall(key)
-        if not data: return []
-        def dec(x): return x.decode('utf-8') if isinstance(x, bytes) else str(x)
-
-        vec_bytes = data.get(b'v') or data.get('v')
-        vec = list(np.frombuffer(vec_bytes, dtype=np.float32))
-
-        return [VectorRow(
-            dec(data.get(b'id') or data.get('id')),
-            dec(data.get(b'sector') or data.get('sector')),
-            vec,
-            int(dec(data.get(b'dim') or data.get('dim')))
-        )]
+        rows = {}
+        # Legacy first; a new-format sector replaces it without deleting history.
+        for key in await self._keys(id):
+            data = await client.hgetall(key)
+            if not data: continue
+            def dec(x): return x.decode('utf-8') if isinstance(x, bytes) else str(x)
+            if dec(data.get(b'id') or data.get('id')) != id: continue
+            sector = dec(data.get(b'sector') or data.get('sector'))
+            vec = np.frombuffer(data.get(b'v') or data.get('v'), dtype=np.float32).tolist()
+            rows[sector] = VectorRow(id, sector, vec,
+                int(dec(data.get(b'dim') or data.get('dim'))),
+                json.loads(data.get(b'provenance') or data.get('provenance') or "null"))
+        return list(rows.values())
 
     async def getVector(self, id: str, sector: str) -> Optional[VectorRow]:
         rows = await self.getVectorsById(id)
@@ -63,16 +76,16 @@ class ValkeyVectorStore(VectorStore):
 
     async def deleteVectors(self, id: str):
         client = await self._get_client()
-        await client.delete(self._key(id))
+        await client.delete(*(await self._keys(id)))
 
     async def search(self, vector: List[float], sector: str, k: int, filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-
+        validate_vector(vector, len(vector))
         client = await self._get_client()
         query_vec = np.array(vector, dtype=np.float32)
         q_norm = np.linalg.norm(query_vec)
 
         cursor = 0
-        results = []
+        results = {}
 
         while True:
             cursor, keys = await client.scan(cursor, match=f"{self.prefix}*", count=100)
@@ -82,12 +95,15 @@ class ValkeyVectorStore(VectorStore):
                     pipe.hgetall(key)
                 items = await pipe.execute()
 
-                for item in items:
+                for key, item in zip(keys, items):
                     if not item: continue
                     def dec(x): return x.decode('utf-8') if isinstance(x, bytes) else str(x)
 
                     i_sector = dec(item.get(b'sector') or item.get('sector'))
                     if i_sector != sector: continue
+                    mid = dec(item.get(b'id') or item.get('id'))
+                    canonical = self._key(mid, i_sector)
+                    if dec(key) != canonical and await client.exists(canonical): continue
 
                     if filter and filter.get("user_id"):
                         i_uid = dec(item.get(b'user_id') or item.get('user_id'))
@@ -95,17 +111,17 @@ class ValkeyVectorStore(VectorStore):
 
                     v_bytes = item.get(b'v') or item.get('v')
                     v = np.frombuffer(v_bytes, dtype=np.float32)
+                    if len(v) != len(vector): continue
 
                     dot = np.dot(query_vec, v)
                     norm = np.linalg.norm(v)
                     sim = dot / (q_norm * norm) if (q_norm * norm) > 0 else 0
 
-                    results.append({
-                        "id": dec(item.get(b'id') or item.get('id')),
+                    results[mid] = {
+                        "id": mid,
                         "similarity": float(sim)
-                    })
+                    }
 
             if cursor == 0: break
 
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results[:k]
+        return sorted(results.values(), key=lambda x: x["similarity"], reverse=True)[:k]

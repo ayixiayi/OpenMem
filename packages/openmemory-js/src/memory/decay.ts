@@ -1,6 +1,7 @@
 import { all_async, run_async, q, vector_store, memories_table } from "../core/db";
 import { now } from "../utils";
 import { env } from "../core/cfg";
+import type { GeneratedEmbedding } from "../core/embedding_contract";
 
 type mem = {
     id: string;
@@ -234,14 +235,13 @@ export const apply_decay = async () => {
     const segments = await q.get_segments.all();
     let tot_proc = 0,
         tot_chg = 0,
-        tot_comp = 0,
-        tot_fp = 0;
+        tot_comp = 0;
     const tier_counts = { hot: 0, warm: 0, cold: 0 };
 
     for (const seg of segments) {
         const segment = seg.segment;
         const rows = await all_async(
-            "select id,content,summary,salience,decay_lambda,last_seen_at,updated_at,primary_sector,coactivations from memories where segment=?",
+            `select id,user_id,content,salience,decay_lambda,last_seen_at,updated_at,primary_sector,feedback_score as coactivations from ${memories_table} where segment=?`,
             [segment],
         );
 
@@ -273,7 +273,7 @@ export const apply_decay = async () => {
                     );
                     const act = Math.max(0, m.coactivations || 0);
                     const sal = clamp_f(
-                        (m.salience || 0.5) * (1 + Math.log1p(act)),
+                        (m.salience ?? 0.5) * (1 + Math.log1p(act)),
                         0,
                         1,
                     );
@@ -281,8 +281,6 @@ export const apply_decay = async () => {
 
                     let new_sal = clamp_f(sal * f, 0, 1);
                     let changed = Math.abs(new_sal - m.salience) > 0.001;
-                    let compressed = false;
-                    let fingerprinted = false;
 
                     if (f < 0.7) {
                         const sector = m.primary_sector || "semantic";
@@ -304,49 +302,17 @@ export const apply_decay = async () => {
                                     cfg.min_vec_dim,
                                     cfg.max_vec_dim,
                                 );
-                                const new_summary = compress_summary(
-                                    m.summary || m.content || "",
-                                    f,
-                                    cfg.summary_layers,
-                                );
-
                                 if (new_vec.length < before_len) {
-                                    await vector_store.storeVector(
-                                        m.id,
-                                        sector,
-                                        new_vec,
-                                        new_vec.length,
-                                    );
-                                    compressed = true;
-                                    tot_comp++;
-                                }
-
-                                if (new_summary !== (m.summary || "")) {
+                                    // A pooled vector is not in the query embedding space.
+                                    // Keep it as a derived cache, never replace the search vector.
                                     await run_async(
-                                        "update memories set summary=? where id=?",
-                                        [new_summary, m.id],
+                                        `update ${memories_table} set compressed_vec=? where id=?`,
+                                        [Buffer.from(new Float32Array(new_vec).buffer), m.id],
                                     );
+                                    tot_comp++;
                                 }
                             }
                         }
-                        changed = true;
-                    }
-
-                    if (f < Math.max(0.3, cfg.cold_threshold)) {
-                        const sector = m.primary_sector || "semantic";
-                        const fp = fingerprint_mem(m);
-                        await vector_store.storeVector(
-                            m.id,
-                            sector,
-                            fp.vector,
-                            fp.vector.length,
-                        );
-                        await run_async(
-                            "update memories set summary=? where id=?",
-                            [fp.summary, m.id],
-                        );
-                        fingerprinted = true;
-                        tot_fp++;
                         changed = true;
                     }
 
@@ -372,14 +338,14 @@ export const apply_decay = async () => {
     const tot = performance.now() - t0;
 
     console.error(
-        `[decay-2.0] ${tot_chg}/${tot_proc} | tiers: hot=${tier_counts.hot} warm=${tier_counts.warm} cold=${tier_counts.cold} | compressed=${tot_comp} fingerprinted=${tot_fp} | ${tot.toFixed(1)}ms across ${segments.length} segments`,
+        `[decay-2.0] ${tot_chg}/${tot_proc} | tiers: hot=${tier_counts.hot} warm=${tier_counts.warm} cold=${tier_counts.cold} | compressed_cache=${tot_comp} | ${tot.toFixed(1)}ms across ${segments.length} segments`,
     );
 };
 
 export const on_query_hit = async (
     mem_id: string,
     sector: string,
-    reembed?: (text: string) => Promise<number[]>,
+    reembed?: (text: string) => Promise<number[] | GeneratedEmbedding>,
 ) => {
     if (!cfg.regeneration_enabled && !cfg.reinforce_on_query) return;
 
@@ -398,12 +364,15 @@ export const on_query_hit = async (
             if (Array.isArray(vec) && vec.length <= 64) {
                 try {
                     const base = m.summary || m.content || "";
-                    const new_vec = await reembed(base);
+                    const result = await reembed(base);
+                    const new_vec = Array.isArray(result) ? result : result.vector;
                     await vector_store.storeVector(
                         mem_id,
                         sector,
                         new_vec,
                         new_vec.length,
+                        m.user_id,
+                        Array.isArray(result) ? null : result.provenance,
                     );
                     updated = true;
                 } catch (e) { }

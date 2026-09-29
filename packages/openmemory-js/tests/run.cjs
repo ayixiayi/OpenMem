@@ -13,6 +13,10 @@ try {
         "test_postgres_transactions",
         "test_ingestion",
         "test_schema_migrations",
+        "test_embedding_contract",
+        "test_embedding_paths",
+        "test_memory_lifecycle",
+        "test_decay",
         "test_auth",
         "test_omnibus",
     ]) {
@@ -45,7 +49,7 @@ try {
             );
         }
     }
-    console.log("[REGRESSION] All 9 offline suites passed");
+    console.log("[REGRESSION] All 13 offline suites passed");
 } finally {
     rmSync(home, { recursive: true, force: true });
 }

@@ -2,6 +2,7 @@
 import { get_model } from "../core/models";
 import { sector_configs } from "./hsg";
 import { q } from "../core/db";
+import { EmbeddingProvenance, GeneratedEmbedding, validateVector } from "../core/embedding_contract";
 import { canonical_tokens_from_text, add_synonym_tokens } from "../utils/text";
 import {
     BedrockRuntimeClient,
@@ -10,7 +11,6 @@ import {
 
 let gem_q: Promise<any> = Promise.resolve();
 export const emb_dim = () => env.vec_dim;
-
 
 const EMBED_TIMEOUT_MS = Number(process.env.OM_EMBED_TIMEOUT_MS) || 30000;
 async function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
@@ -27,7 +27,15 @@ export interface EmbeddingResult {
     sector: string;
     vector: number[];
     dim: number;
+    provenance: EmbeddingProvenance;
 }
+
+function generated(vector: number[], sector: string, provider: string, model: string, transform = "identity-v1", sources?: EmbeddingProvenance[]): GeneratedEmbedding {
+    validateVector(vector, vector?.length);
+    return { vector, provenance: { schema_version: 1, provider, model, sector, dimensions: vector.length, transform, ...(sources ? { sources } : {}) } };
+}
+
+const synthetic = (text: string, sector: string) => generated(gen_syn_emb(text, sector), sector, "synthetic", "openmemory-js-synthetic-v1");
 
 const compress_vec = (v: number[], td: number): number[] => {
     if (v.length <= td) return v;
@@ -77,49 +85,39 @@ const fuse_vecs = (syn: number[], sem: number[]): number[] => {
 };
 
 export async function embedForSector(t: string, s: string): Promise<number[]> {
+    return (await embedForSectorWithProvenance(t, s)).vector;
+}
+
+export async function embedForSectorWithProvenance(t: string, s: string): Promise<GeneratedEmbedding> {
     console.error(`[EMBED] Provider: ${env.emb_kind}, Tier: ${tier}, Sector: ${s}`);
     if (!sector_configs[s]) throw new Error(`Unknown sector: ${s}`);
-    if (tier === "hybrid") return gen_syn_emb(t, s);
+    if (tier === "hybrid") return synthetic(t, s);
     if (tier === "smart" && env.emb_kind !== "synthetic") {
-        const syn = gen_syn_emb(t, s),
+        const syn = synthetic(t, s),
             sem = await get_sem_emb(t, s),
-            comp = compress_vec(sem, 128);
-        return fuse_vecs(syn, comp);
+            comp = compress_vec(sem.vector, 128);
+        return generated(fuse_vecs(syn.vector, comp), s, "composite", "smart", "concat-0.6-0.4-blockmean128-l2-v1", [syn.provenance, sem.provenance]);
     }
-    if (tier === "fast") return gen_syn_emb(t, s);
+    if (tier === "fast") return synthetic(t, s);
     return await get_sem_emb(t, s);
 }
 
-/**
- * Batch embed query text for ALL sectors in one API call.
- * This significantly improves query performance by reducing 5 sequential
- * API calls to a single batched call (~4.5x faster for deep tier).
- */
+/** Keep the public float-array API while sharing the document generation policy. */
 export async function embedQueryForAllSectors(
     query: string,
     sectors: string[],
 ): Promise<Record<string, number[]>> {
+    const result = await embedQueryWithProvenance(query, sectors);
+    return Object.fromEntries(Object.entries(result).map(([sector, value]) => [sector, value.vector]));
+}
 
-    if (tier === "hybrid" || tier === "fast") {
-        const result: Record<string, number[]> = {};
-        for (const s of sectors) result[s] = gen_syn_emb(query, s);
-        return result;
+export async function embedQueryWithProvenance(query: string, sectors: string[]): Promise<Record<string, GeneratedEmbedding>> {
+    for (const sector of sectors) if (!sector_configs[sector]) throw new Error(`Unknown sector: ${sector}`);
+    if (env.embed_mode === "simple" && (env.emb_kind === "gemini" || env.emb_kind === "openai")) {
+        return emb_batch_with_fallback(Object.fromEntries(sectors.map(sector => [sector, query])));
     }
-
-
-    if (env.emb_kind === "gemini" && env.gemini_key) {
-        try {
-            const txts: Record<string, string> = {};
-            for (const s of sectors) txts[s] = query;
-            return await emb_gemini(txts);
-        } catch (e) {
-            console.error(`[EMBED] Gemini batch failed, falling back to sequential: ${e}`);
-        }
-    }
-
-
-    const result: Record<string, number[]> = {};
-    for (const s of sectors) result[s] = await embedForSector(query, s);
+    const result: Record<string, GeneratedEmbedding> = {};
+    for (const s of sectors) result[s] = await embedForSectorWithProvenance(query, s);
     return result;
 }
 
@@ -128,29 +126,37 @@ async function embed_with_provider(
     provider: string,
     t: string,
     s: string,
-): Promise<number[]> {
+): Promise<GeneratedEmbedding> {
     switch (provider) {
-        case "openai":
-            return await emb_openai(t, s);
+        case "openai": {
+            const model = env.openai_model || get_model(s, provider);
+            return generated(await emb_openai(t, s), s, provider, model);
+        }
         case "gemini":
-            return (await emb_gemini({ [s]: t }))[s];
-        case "ollama":
-            return await emb_ollama(t, s);
-        case "aws":
-            return await emb_aws(t, s);
+            return generated((await emb_gemini({ [s]: t }))[s], s, provider, "models/text-embedding-004", `truncate-pad-v1:${task_map[s] || task_map.semantic}`);
+        case "ollama": {
+            const model = get_model(s, provider);
+            return generated(await emb_ollama(t, s), s, provider, model, "truncate-pad-v1");
+        }
+        case "aws": {
+            const model = get_model(s, provider);
+            return generated(await emb_aws(t, s), s, provider, model, "truncate-pad-v1");
+        }
         case "local":
             return await emb_local(t, s);
         case "synthetic":
-            return gen_syn_emb(t, s);
-        case "siray":
-            return await emb_siray(t, s);
+            return synthetic(t, s);
+        case "siray": {
+            const model = get_model(s, provider);
+            return generated(await emb_siray(t, s), s, provider, model);
+        }
         default:
             throw new Error(`Unknown embedding provider: ${provider}`);
     }
 }
 
 
-async function get_sem_emb(t: string, s: string): Promise<number[]> {
+async function get_sem_emb(t: string, s: string): Promise<GeneratedEmbedding> {
 
     const providers = [...new Set([env.emb_kind, ...env.embedding_fallback])];
 
@@ -176,32 +182,37 @@ async function get_sem_emb(t: string, s: string): Promise<number[]> {
                 console.error(
                     `[EMBED] All providers failed. Last error (${provider}): ${errMsg}. Using synthetic.`,
                 );
-                return gen_syn_emb(t, s);
+                return synthetic(t, s);
             }
         }
     }
 
-    return gen_syn_emb(t, s);
+    return synthetic(t, s);
 }
 
 
 
 async function emb_batch_with_fallback(
     txts: Record<string, string>,
-): Promise<Record<string, number[]>> {
+): Promise<Record<string, GeneratedEmbedding>> {
     const providers = [...new Set([env.emb_kind, ...env.embedding_fallback])];
 
     for (let i = 0; i < providers.length; i++) {
         const provider = providers[i];
         try {
-            let result: Record<string, number[]>;
+            let result: Record<string, GeneratedEmbedding>;
             switch (provider) {
-                case "gemini":
-                    result = await emb_gemini(txts);
+                case "gemini": {
+                    const batch = await emb_gemini(txts);
+                    result = Object.fromEntries(Object.entries(batch).map(([s, v]) => [s, generated(v, s, provider, "models/text-embedding-004", `truncate-pad-v1:${task_map[s] || task_map.semantic}`)]));
                     break;
-                case "openai":
-                    result = await emb_batch_openai(txts);
+                }
+                case "openai": {
+                    const model = env.openai_model || get_model("semantic", provider);
+                    const batch = await emb_batch_openai(txts);
+                    result = Object.fromEntries(Object.entries(batch).map(([s, v]) => [s, generated(v, s, provider, model)]));
                     break;
+                }
                 default:
 
                     result = {};
@@ -228,18 +239,18 @@ async function emb_batch_with_fallback(
                     `[EMBED] All providers failed for batch. Last error (${provider}): ${errMsg}. Using synthetic.`,
                 );
 
-                const result: Record<string, number[]> = {};
+                const result: Record<string, GeneratedEmbedding> = {};
                 for (const [s, t] of Object.entries(txts)) {
-                    result[s] = gen_syn_emb(t, s);
+                    result[s] = synthetic(t, s);
                 }
                 return result;
             }
         }
     }
 
-    const result: Record<string, number[]> = {};
+    const result: Record<string, GeneratedEmbedding> = {};
     for (const [s, t] of Object.entries(txts)) {
-        result[s] = gen_syn_emb(t, s);
+        result[s] = synthetic(t, s);
     }
     return result;
 }
@@ -290,8 +301,13 @@ async function emb_batch_openai(
     if (!r.ok) throw new Error(`OpenAI batch: ${r.status}`);
     const d = (await r.json()) as any,
         out: Record<string, number[]> = {};
-    secs.forEach((s, i) => (out[s] = d.data[i].embedding));
-    return out;
+    if (!Array.isArray(d.data) || d.data.length !== secs.length) throw new Error("OpenAI batch returned an incomplete result");
+    d.data.forEach((item: any, position: number) => {
+        const index = item.index ?? position;
+        if (!Number.isInteger(index) || index < 0 || index >= secs.length || secs[index] in out) throw new Error("OpenAI batch returned invalid indexes");
+        out[secs[index]] = item.embedding;
+    });
+    return Object.fromEntries(secs.map(sector => [sector, out[sector]]));
 }
 
 const task_map: Record<string, string> = {
@@ -427,10 +443,10 @@ async function emb_siray(t: string, s: string): Promise<number[]> {
     return ((await r.json()) as any).data[0].embedding;
 }
 
-async function emb_local(t: string, s: string): Promise<number[]> {
+async function emb_local(t: string, s: string): Promise<GeneratedEmbedding> {
     if (!env.local_model_path) {
         console.error("[EMBED] Local model missing, using synthetic");
-        return gen_syn_emb(t, s);
+        return synthetic(t, s);
     }
     try {
         const { createHash } = await import("crypto");
@@ -444,10 +460,11 @@ async function emb_local(t: string, s: string): Promise<number[]> {
             e.push(((b1 * 256 + b2) / 65535) * 2 - 1);
         }
         const n = Math.sqrt(e.reduce((sum, v) => sum + v * v, 0));
-        return e.map((v) => v / n);
+        // The legacy local path hashes text; it does not load model weights.
+        return generated(e.map((v) => v / n), s, "synthetic", "openmemory-js-sha256-placeholder-v1");
     } catch {
         console.error("[EMBED] Local embedding failed, using synthetic");
-        return gen_syn_emb(t, s);
+        return synthetic(t, s);
     }
 }
 
@@ -574,10 +591,20 @@ export async function embedMultiSector(
     secs: string[],
     chunks?: Array<{ text: string }>,
 ): Promise<EmbeddingResult[]> {
-    const r: EmbeddingResult[] = [];
     await q.ins_log.run(id, "multi-sector", "pending", Date.now(), null);
     for (let a = 0; a < 3; a++) {
         try {
+            // A retry must not retain sectors produced by an earlier attempt.
+            const r: EmbeddingResult[] = [];
+            const one = async (s: string): Promise<EmbeddingResult> => {
+                let embedding: GeneratedEmbedding;
+                if (chunks && chunks.length > 1) {
+                    const parts: GeneratedEmbedding[] = [];
+                    for (const chunk of chunks) parts.push(await embedForSectorWithProvenance(chunk.text, s));
+                    embedding = aggregateEmbeddings(parts, s);
+                } else embedding = await embedForSectorWithProvenance(txt, s);
+                return { sector: s, ...embedding, dim: embedding.vector.length };
+            };
             const simp = env.embed_mode === "simple";
             if (
                 simp &&
@@ -591,34 +618,18 @@ export async function embedMultiSector(
 
                 const b = await emb_batch_with_fallback(tb);
                 Object.entries(b).forEach(([s, v]) =>
-                    r.push({ sector: s, vector: v, dim: v.length }),
+                    r.push({ sector: s, ...v, dim: v.vector.length }),
                 );
             } else {
                 console.error(`[EMBED] Advanced mode (${secs.length} calls)`);
                 const par = env.adv_embed_parallel && env.emb_kind !== "gemini";
                 if (par) {
-                    const p = secs.map(async (s) => {
-                        let v: number[];
-                        if (chunks && chunks.length > 1) {
-                            const cv: number[][] = [];
-                            for (const c of chunks)
-                                cv.push(await embedForSector(c.text, s));
-                            v = agg_chunks(cv);
-                        } else v = await embedForSector(txt, s);
-                        return { sector: s, vector: v, dim: v.length };
-                    });
+                    const p = secs.map(one);
                     r.push(...(await Promise.all(p)));
                 } else {
                     for (let i = 0; i < secs.length; i++) {
                         const s = secs[i];
-                        let v: number[];
-                        if (chunks && chunks.length > 1) {
-                            const cv: number[][] = [];
-                            for (const c of chunks)
-                                cv.push(await embedForSector(c.text, s));
-                            v = agg_chunks(cv);
-                        } else v = await embedForSector(txt, s);
-                        r.push({ sector: s, vector: v, dim: v.length });
+                        r.push(await one(s));
                         if (env.embed_delay_ms > 0 && i < secs.length - 1)
                             await new Promise((x) =>
                                 setTimeout(x, env.embed_delay_ms),
@@ -643,13 +654,20 @@ export async function embedMultiSector(
     throw new Error("Embedding failed after retries");
 }
 
-const agg_chunks = (vecs: number[][]): number[] => {
-    if (!vecs.length) throw new Error("No vectors");
-    if (vecs.length === 1) return vecs[0];
-    const d = vecs[0].length,
+export const aggregateEmbeddings = (parts: GeneratedEmbedding[], sector: string): GeneratedEmbedding => {
+    if (!parts.length) throw new Error("No vectors");
+    if (parts.length === 1) return parts[0];
+    const identity = JSON.stringify(parts[0].provenance);
+    if (parts.some(part => JSON.stringify(part.provenance) !== identity)) {
+        throw new Error("Cannot average chunks from different embedding spaces");
+    }
+    const d = parts[0].vector.length,
         r = Array(d).fill(0);
-    for (const v of vecs) for (let i = 0; i < d; i++) r[i] += v[i];
-    return r.map((x) => x / vecs.length);
+    for (const part of parts) {
+        validateVector(part.vector, d);
+        for (let i = 0; i < d; i++) r[i] += part.vector[i];
+    }
+    return generated(r.map((x) => x / parts.length), sector, "composite", "chunk-mean", "arithmetic-mean-v1", [parts[0].provenance]);
 };
 
 export const cosineSimilarity = (a: number[], b: number[]) => {

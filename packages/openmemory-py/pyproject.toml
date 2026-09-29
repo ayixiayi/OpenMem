@@ -26,5 +26,13 @@ dependencies = [
     "openai>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "black"]
+postgres = ["asyncpg>=0.29"]
+valkey = ["redis>=5"]
+
+[tool.pytest.ini_options]
+markers = ["integration: requires explicitly enabled external services"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/openmemory"]

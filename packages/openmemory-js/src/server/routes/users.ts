@@ -1,4 +1,5 @@
-import { q, vector_store } from "../../core/db";
+import { q } from "../../core/db";
+import { delete_memory } from "../../memory/hsg";
 import { p } from "../../utils";
 import {
     update_user_summary,
@@ -93,14 +94,13 @@ export const usr = (app: any) => {
             if (!user_id)
                 return res.status(400).json({ err: "user_id required" });
 
-            const mems = await q.all_mem_by_user.all(user_id, 10000, 0);
             let deleted = 0;
-
-            for (const m of mems) {
-                await q.del_mem.run(m.id);
-                await vector_store.deleteVectors(m.id);
-                await q.del_waypoints.run(m.id, m.id);
-                deleted++;
+            while (true) {
+                const mems = await q.all_mem_by_user.all(user_id, 100, 0);
+                if (!mems.length) break;
+                for (const m of mems) {
+                    if (await delete_memory(m.id)) deleted++;
+                }
             }
 
             res.json({ ok: true, deleted });

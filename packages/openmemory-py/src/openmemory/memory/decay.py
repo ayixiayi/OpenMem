@@ -128,11 +128,10 @@ async def apply_decay():
     tot_proc = 0
     tot_chg = 0
     tot_comp = 0
-    tot_fp = 0
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
 
     for seg in segments:
-        rows = db.fetchall("SELECT id,content,summary,salience,decay_lambda,last_seen_at,updated_at,primary_sector,feedback_score as coactivations FROM memories WHERE segment=?", (seg,))
+        rows = db.fetchall("SELECT id,user_id,content,salience,decay_lambda,last_seen_at,updated_at,primary_sector,feedback_score as coactivations FROM memories WHERE segment=?", (seg,))
 
         decay_ratio = env.decay_ratio or 0.03
         batch_sz = max(1, int(len(rows) * decay_ratio))
@@ -149,7 +148,7 @@ async def apply_decay():
             lam = cfg.lambda_hot if m_tier == "hot" else (cfg.lambda_warm if m_tier == "warm" else cfg.lambda_cold)
             dt = max(0, (now_ts - (dict_m["last_seen_at"] or dict_m["updated_at"] or 0)) / cfg.time_unit_ms)
             act = max(0, dict_m.get("coactivations") or dict_m.get("feedback_score") or 0)
-            sal = max(0.0, min(1.0, (dict_m["salience"] or 0.5) * (1 + math.log1p(act))))
+            sal = max(0.0, min(1.0, (dict_m["salience"] if dict_m["salience"] is not None else 0.5) * (1 + math.log1p(act))))
 
             f = math.exp(-lam * (dt / (sal + 0.1)))
             new_sal = max(0.0, min(1.0, sal * f))
@@ -163,16 +162,10 @@ async def apply_decay():
                          new_vec = compress_vector(vec, f, cfg.min_vec_dim, cfg.max_vec_dim)
 
                          if len(new_vec) < len(vec):
-                             await store.storeVector(dict_m["id"], sector, new_vec, len(new_vec))
+                             # Pooled vectors cannot be compared to full query embeddings.
+                             db.conn.execute("UPDATE memories SET compressed_vec=? WHERE id=?", (vec_to_buf(new_vec), dict_m["id"]))
                              tot_comp += 1
                              changed = True
-            if f < max(0.3, cfg.cold_threshold):
-                sector = dict_m["primary_sector"] or "semantic"
-                fp = fingerprint_mem(dict_m)
-                await store.storeVector(dict_m["id"], sector, fp["vector"], len(fp["vector"]))
-                db.conn.execute("UPDATE memories SET summary=? WHERE id=?", (fp["summary"], dict_m["id"]))
-                tot_fp += 1
-                changed = True
 
             if changed:
                 db.conn.execute("UPDATE memories SET salience=?, updated_at=? WHERE id=?", (new_sal, int(time.time()*1000), dict_m["id"]))
@@ -183,7 +176,7 @@ async def apply_decay():
 
     db.commit()
     dur = (time.time() - t0) * 1000
-    print(f"[decay] {tot_chg}/{tot_proc} | tiers: {tier_counts} | comp={tot_comp} fp={tot_fp} | {dur:.1f}ms")
+    print(f"[decay] {tot_chg}/{tot_proc} | tiers: {tier_counts} | compressed_cache={tot_comp} | {dur:.1f}ms")
 
 async def on_query_hit(mem_id: str, sector: str, reembed_fn = None):
     if not cfg.regeneration_enabled and not cfg.reinforce_on_query: return
@@ -196,9 +189,11 @@ async def on_query_hit(mem_id: str, sector: str, reembed_fn = None):
         vec_row = await store.getVector(mem_id, sector)
         if vec_row and vec_row.vector and len(vec_row.vector) <= 64:
              try:
-                 base = m["summary"] or m["content"] or ""
-                 new_vec = await reembed_fn(base)
-                 await store.storeVector(mem_id, sector, new_vec, len(new_vec))
+                 base = dict(m).get("summary") or m["content"] or ""
+                 result = await reembed_fn(base)
+                 new_vec = result["vector"] if isinstance(result, dict) else result
+                 provenance = result.get("provenance") if isinstance(result, dict) else None
+                 await store.storeVector(mem_id, sector, new_vec, len(new_vec), m["user_id"], provenance)
                  updated = True
              except Exception:
                  pass

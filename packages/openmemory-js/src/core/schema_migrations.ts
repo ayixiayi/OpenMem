@@ -126,6 +126,13 @@ export async function migrate_sqlite(db: sqlite3.Database): Promise<void> {
             }
             await run("insert into _om_migrations values(1)");
         }
+        if (
+            !(await all("select version from _om_migrations where version=2"))
+                .length
+        ) {
+            await run("alter table vectors add column provenance text");
+            await run("insert into _om_migrations values(2)");
+        }
         await run("COMMIT");
     } catch (error) {
         await run("ROLLBACK");
@@ -137,6 +144,7 @@ export async function migrate_postgres(
     pool: Pool,
     schema: string,
     memories: string,
+    vectors: string,
 ): Promise<void> {
     const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
     const prefix = quote(schema);
@@ -192,6 +200,18 @@ export async function migrate_postgres(
                 );
             }
             await client.query(`insert into ${versions} values(1)`);
+        }
+        if (
+            !(
+                await client.query(
+                    `select version from ${versions} where version=2`,
+                )
+            ).rows.length
+        ) {
+            await client.query(
+                `alter table ${vectors} add column provenance text`,
+            );
+            await client.query(`insert into ${versions} values(2)`);
         }
         await client.query("COMMIT");
     } catch (error) {

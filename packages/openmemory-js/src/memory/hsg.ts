@@ -669,6 +669,7 @@ export async function prune_weak_waypoints(): Promise<number> {
 import {
     embedForSector,
     embedQueryForAllSectors,
+    embedQueryWithProvenance,
     embedMultiSector,
     cosineSimilarity,
     bufferToVector,
@@ -709,7 +710,7 @@ export async function calc_multi_vec_fusion_score(
     };
     for (const v of vecs) {
         const qv = qe[v.sector];
-        if (!qv) continue;
+        if (!qv || qv.length !== v.vector.length) continue;
         const mv = v.vector;
         const sim = cosineSimilarity(qv, mv);
         const wgt = wm[v.sector] || 0.5;
@@ -718,7 +719,6 @@ export async function calc_multi_vec_fusion_score(
     }
     return tot > 0 ? sum / tot : 0;
 }
-const cache = new Map<string, { r: hsg_q_result[]; t: number }>();
 const sal_cache = new Map<string, { s: number; t: number }>();
 
 const seg_cache = new Map<number, any[]>();
@@ -787,9 +787,6 @@ export async function hsg_query(
     active_queries++;
     inc_q();
     try {
-        const h = `${qt}:${k}:${JSON.stringify(f || {})}`;
-        const cached = cache.get(h);
-        if (cached && Date.now() - cached.t < TTL) return cached.r;
         const qc = classify_content(qt);
         const is_temporal = has_temporal_markers(qt);
         const qtk = canonical_token_set(qt);
@@ -1013,11 +1010,10 @@ export async function hsg_query(
 
         for (const r of top) {
             on_query_hit(r.id, r.primary_sector, (text) =>
-                embedForSector(text, r.primary_sector),
+                embedQueryWithProvenance(text, [r.primary_sector]).then(result => result[r.primary_sector]),
             ).catch(() => { });
         }
 
-        cache.set(h, { r: top, t: Date.now() });
         return top;
     } finally {
         active_queries--;
@@ -1162,6 +1158,7 @@ export async function add_hsg_memory(
                 result.vector,
                 result.dim,
                 user_id || "anonymous",
+                result.provenance,
             );
         }
         const mean_vec = calc_mean_vec(emb_res, all_sectors);
@@ -1188,9 +1185,9 @@ export async function delete_memory(id: string): Promise<boolean> {
     const mem = await q.get_mem.get(id);
     if (!mem) return false;
     return transaction.run(async () => {
+        await vector_store.deleteVectors(id);
         await q.del_mem.run(id);
         await q.del_waypoints.run(id, id);
-        await vector_store.deleteVectors(id);
         return true;
     });
 }
@@ -1224,13 +1221,13 @@ export async function update_memory(
                 classification.primary,
                 ...classification.additional,
             ];
-            await vector_store.deleteVectors(id);
             const emb_res = await embedMultiSector(
                 id,
                 new_content,
                 all_sectors,
                 use_chunking ? chunks : undefined,
             );
+            await vector_store.deleteVectors(id);
             for (const result of emb_res) {
                 await vector_store.storeVector(
                     id,
@@ -1238,6 +1235,7 @@ export async function update_memory(
                     result.vector,
                     result.dim,
                     mem.user_id || "anonymous",
+                    result.provenance,
                 );
             }
             const mean_vec = calc_mean_vec(emb_res, all_sectors);

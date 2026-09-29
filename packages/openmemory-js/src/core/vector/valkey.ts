@@ -1,4 +1,5 @@
-import { VectorStore } from "../vector_store";
+import { VectorStore, StoredEmbedding } from "../vector_store";
+import { EmbeddingProvenance, validateVector, validateProvenance } from "../embedding_contract";
 import Redis from "ioredis";
 import { env } from "../cfg";
 import { vectorToBuffer, bufferToVector } from "../../memory/embed";
@@ -18,7 +19,9 @@ export class ValkeyVectorStore implements VectorStore {
         return `vec:${sector}:${id}`;
     }
 
-    async storeVector(id: string, sector: string, vector: number[], dim: number, user_id?: string): Promise<void> {
+    async storeVector(id: string, sector: string, vector: number[], dim: number, user_id?: string, provenance: EmbeddingProvenance | null = null): Promise<void> {
+        validateVector(vector, dim);
+        validateProvenance(provenance, sector, dim);
         const key = this.getKey(id, sector);
         const buf = vectorToBuffer(vector);
 
@@ -27,7 +30,8 @@ export class ValkeyVectorStore implements VectorStore {
             dim: dim,
             user_id: user_id || "anonymous",
             id: id,
-            sector: sector
+            sector: sector,
+            provenance: JSON.stringify(provenance)
         });
     }
 
@@ -62,6 +66,7 @@ export class ValkeyVectorStore implements VectorStore {
     }
 
     async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
+        validateVector(queryVec, queryVec.length);
         // Metadata is authoritative for scope. Rank its vectors before limiting;
         // a global KNN followed by filtering can discard every eligible memory.
         if ((user_id || project) && this.scopedMemoryIds) {
@@ -74,7 +79,10 @@ export class ValkeyVectorStore implements VectorStore {
                 const rows = await pipeline.exec();
                 rows?.forEach(([error, value], index) => {
                     if (error) throw error;
-                    if (value) results.push({ id: batch[index], score: this.cosineSimilarity(queryVec, bufferToVector(value as Buffer)) });
+                    if (value) {
+                        const vector = bufferToVector(value as Buffer);
+                        if (vector.length === queryVec.length) results.push({ id: batch[index], score: this.cosineSimilarity(queryVec, vector) });
+                    }
                 });
             }
             results.sort((a, b) => b.score - a.score);
@@ -130,30 +138,32 @@ export class ValkeyVectorStore implements VectorStore {
 
             // Fallback: scan all vectors and filter
             let cursor = "0";
-            const allVecs: Array<{ id: string; vector: number[]; user_id: string }> = [];
+            const allVecs = new Map<string, { id: string; vector: number[]; user_id: string }>();
             do {
                 const res = await this.client.scan(cursor, "MATCH", `vec:${sector}:*`, "COUNT", 100);
                 cursor = res[0];
                 const keys = res[1];
                 if (keys.length) {
                     const pipe = this.client.pipeline();
-                    keys.forEach(k => pipe.hmget(k, "v", "user_id"));
+                    keys.forEach(k => pipe.hmgetBuffer(k, "v", "user_id"));
                     const buffers = await pipe.exec();
                     buffers?.forEach((b, idx) => {
                         if (b && b[1]) {
-                            const [buf, vec_user_id] = b[1] as [Buffer, string];
+                            const [buf, owner] = b[1] as [Buffer | null, Buffer | null];
+                            if (!buf) return;
+                            const vec_user_id = owner?.toString() || "";
                             const id = keys[idx].split(":").pop()!;
 
                             // Filter by user_id during scan
                             if (!user_id || vec_user_id === user_id) {
-                                allVecs.push({ id, vector: bufferToVector(buf), user_id: vec_user_id });
+                                allVecs.set(id, { id, vector: bufferToVector(buf), user_id: vec_user_id });
                             }
                         }
                     });
                 }
             } while (cursor !== "0");
 
-            const sims = allVecs.map(v => ({
+            const sims = Array.from(allVecs.values()).filter(v => v.vector.length === queryVec.length).map(v => ({
                 id: v.id,
                 score: this.cosineSimilarity(queryVec, v.vector)
             }));
@@ -173,19 +183,20 @@ export class ValkeyVectorStore implements VectorStore {
         return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
     }
 
-    async getVector(id: string, sector: string): Promise<{ vector: number[]; dim: number } | null> {
+    async getVector(id: string, sector: string): Promise<StoredEmbedding | null> {
         const key = this.getKey(id, sector);
-        const res = await this.client.hmget(key, "v", "dim");
+        const res = await this.client.hmgetBuffer(key, "v", "dim", "provenance");
         if (!res[0]) return null;
         return {
-            vector: bufferToVector(res[0] as unknown as Buffer),
-            dim: parseInt(res[1] as string)
+            vector: bufferToVector(res[0]),
+            dim: Number(res[1]?.toString()),
+            provenance: res[2] ? JSON.parse(res[2].toString()) : null
         };
     }
 
-    async getVectorsById(id: string): Promise<Array<{ sector: string; vector: number[]; dim: number }>> {
+    async getVectorsById(id: string): Promise<Array<StoredEmbedding & { sector: string }>> {
 
-        const results: Array<{ sector: string; vector: number[]; dim: number }> = [];
+        const results = new Map<string, StoredEmbedding & { sector: string }>();
         let cursor = "0";
         do {
             const res = await this.client.scan(cursor, "MATCH", `vec:*:${id}`, "COUNT", 100);
@@ -193,28 +204,30 @@ export class ValkeyVectorStore implements VectorStore {
             const keys = res[1];
             if (keys.length) {
                 const pipe = this.client.pipeline();
-                keys.forEach(k => pipe.hmget(k, "v", "dim"));
+                keys.forEach(k => pipe.hmgetBuffer(k, "v", "dim", "provenance"));
                 const res = await pipe.exec();
                 res?.forEach((r, idx) => {
                     if (r && r[1]) {
-                        const [v, dim] = r[1] as [Buffer, string];
+                        const [v, dim, provenance] = r[1] as [Buffer, Buffer, Buffer | null];
+                        if (!v || !dim) return;
                         const key = keys[idx];
                         const parts = key.split(":");
                         const sector = parts[1];
-                        results.push({
+                        results.set(sector, {
                             sector,
                             vector: bufferToVector(v),
-                            dim: parseInt(dim)
+                            dim: Number(dim.toString()),
+                            provenance: provenance ? JSON.parse(provenance.toString()) : null
                         });
                     }
                 });
             }
         } while (cursor !== "0");
-        return results;
+        return Array.from(results.values());
     }
 
-    async getVectorsBySector(sector: string): Promise<Array<{ id: string; vector: number[]; dim: number }>> {
-        const results: Array<{ id: string; vector: number[]; dim: number }> = [];
+    async getVectorsBySector(sector: string): Promise<Array<StoredEmbedding & { id: string }>> {
+        const results = new Map<string, StoredEmbedding & { id: string }>();
         let cursor = "0";
         do {
             const res = await this.client.scan(cursor, "MATCH", `vec:${sector}:*`, "COUNT", 100);
@@ -222,22 +235,24 @@ export class ValkeyVectorStore implements VectorStore {
             const keys = res[1];
             if (keys.length) {
                 const pipe = this.client.pipeline();
-                keys.forEach(k => pipe.hmget(k, "v", "dim"));
+                keys.forEach(k => pipe.hmgetBuffer(k, "v", "dim", "provenance"));
                 const res = await pipe.exec();
                 res?.forEach((r, idx) => {
                     if (r && r[1]) {
-                        const [v, dim] = r[1] as [Buffer, string];
+                        const [v, dim, provenance] = r[1] as [Buffer, Buffer, Buffer | null];
+                        if (!v || !dim) return;
                         const key = keys[idx];
                         const id = key.split(":").pop()!;
-                        results.push({
+                        results.set(id, {
                             id,
                             vector: bufferToVector(v),
-                            dim: parseInt(dim)
+                            dim: Number(dim.toString()),
+                            provenance: provenance ? JSON.parse(provenance.toString()) : null
                         });
                     }
                 });
             }
         } while (cursor !== "0");
-        return results;
+        return Array.from(results.values());
     }
 }
