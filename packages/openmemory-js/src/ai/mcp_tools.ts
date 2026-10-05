@@ -25,6 +25,10 @@ export class ToolRegistry {
         });
     }
 
+    names(): string[] {
+        return [...this.tools.keys()];
+    }
+
     apply(server: McpServer) {
 
 

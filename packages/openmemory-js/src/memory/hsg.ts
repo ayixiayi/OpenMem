@@ -123,6 +123,7 @@ export const scoring_weights = {
     waypoint: 0.15,
     recency: 0.10,
     tag_match: 0.20,
+    lexical: 0.30,
 };
 export const hybrid_params = {
     tau: 3,
@@ -153,6 +154,23 @@ export const sector_relationships: Record<string, Record<string, number>> = {
     emotional: { episodic: 0.7, reflective: 0.6, semantic: 0.4, procedural: 0.3 },
 };
 
+
+const fts_stopwords = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for",
+    "from", "how", "in", "is", "it", "of", "on", "or", "that", "the", "this",
+    "to", "was", "we", "what", "when", "where", "which", "who", "why", "with",
+]);
+
+/** Plain word tokens that are safe to splice into FTS5 / tsquery syntax. */
+export function fts_terms(text: string, max = 16): string[] {
+    const terms = new Set<string>();
+    for (const [tok] of text.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
+        if (tok.length < 2 || fts_stopwords.has(tok)) continue;
+        terms.add(tok);
+        if (terms.size >= max) break;
+    }
+    return [...terms];
+}
 
 function has_temporal_markers(text: string): boolean {
     const temporal_patterns = [
@@ -425,6 +443,7 @@ export function compute_hybrid_score(
     rec_sc: number,
     keyword_score: number = 0,
     tag_match: number = 0,
+    lexical: number = 0,
 ): number {
     const s_p = boosted_sim(sim);
     const raw =
@@ -433,8 +452,11 @@ export function compute_hybrid_score(
         scoring_weights.waypoint * wp_wt +
         scoring_weights.recency * rec_sc +
         scoring_weights.tag_match * tag_match +
+        scoring_weights.lexical * lexical +
         keyword_score;
-    return sigmoid(raw);
+    // Map the non-negative evidence sum onto [0, 1) so scores are comparable
+    // across queries and `min_score` thresholds mean something.
+    return Math.tanh(Math.max(0, raw));
 }
 import {
     q,
@@ -451,33 +473,6 @@ function same_memory_scope(a: any, b: any): boolean {
     return !!a && !!b && a.user_id === b.user_id && a.project === b.project;
 }
 
-export async function create_cross_sector_waypoints(
-    prim_id: string,
-    prim_sec: string,
-    add_secs: string[],
-    user_id?: string | null,
-): Promise<void> {
-    const now = Date.now();
-    const wt = 0.5;
-    for (const sec of add_secs) {
-        await q.ins_waypoint.run(
-            prim_id,
-            `${prim_id}:${sec}`,
-            user_id || "anonymous",
-            wt,
-            now,
-            now,
-        );
-        await q.ins_waypoint.run(
-            `${prim_id}:${sec}`,
-            prim_id,
-            user_id || "anonymous",
-            wt,
-            now,
-            now,
-        );
-    }
-}
 export function calc_mean_vec(
     emb_res: EmbeddingResult[],
     secs: string[],
@@ -541,43 +536,6 @@ export async function create_single_waypoint(
         await q.ins_waypoint.run(new_id, new_id, user_id || "anonymous", 1.0, ts, ts);
     }
 }
-export async function create_inter_mem_waypoints(
-    new_id: string,
-    prim_sec: string,
-    new_vec: number[],
-    ts: number,
-    user_id?: string | null,
-): Promise<void> {
-    const thresh = 0.75;
-    const wt = 0.5;
-    const source = await q.get_mem.get(new_id);
-    if (!source) return;
-    const vecs = await vector_store.getVectorsBySector(prim_sec);
-    for (const vr of vecs) {
-        if (vr.id === new_id) continue;
-        if (!same_memory_scope(source, await q.get_mem.get(vr.id))) continue;
-        const ex_vec = vr.vector;
-        const sim = cos_sim(new Float32Array(new_vec), new Float32Array(ex_vec));
-        if (sim >= thresh) {
-            await q.ins_waypoint.run(
-                new_id,
-                vr.id,
-                user_id || "anonymous",
-                wt,
-                ts,
-                ts,
-            );
-            await q.ins_waypoint.run(
-                vr.id,
-                new_id,
-                user_id || "anonymous",
-                wt,
-                ts,
-                ts,
-            );
-        }
-    }
-}
 export async function create_contextual_waypoints(
     mem_id: string,
     rel_ids: string[],
@@ -624,12 +582,10 @@ export async function expand_via_waypoints(
     let exp_cnt = 0;
     while (q_arr.length > 0 && exp_cnt < max_exp) {
         const cur = q_arr.shift()!;
-        const source = await q.get_mem.get(cur.id);
+        // get_neighbors only returns edges whose endpoints share user and project.
         const neighs = await q.get_neighbors.all(cur.id);
         for (const neigh of neighs) {
             if (vis.has(neigh.dst_id)) continue;
-            if (!same_memory_scope(source, await q.get_mem.get(neigh.dst_id))) continue;
-
             const neigh_wt = Math.min(1.0, Math.max(0, neigh.weight || 0));
             const exp_wt = cur.weight * neigh_wt * 0.8;
             if (exp_wt < 0.1) continue;
@@ -719,24 +675,8 @@ export async function calc_multi_vec_fusion_score(
     }
     return tot > 0 ? sum / tot : 0;
 }
-const sal_cache = new Map<string, { s: number; t: number }>();
-
-const seg_cache = new Map<number, any[]>();
 const coact_buf: Array<[string, string]> = [];
-const TTL = 60000;
-const VEC_CACHE_MAX = 1000;
 let active_queries = 0;
-
-const get_segment = async (seg: number): Promise<any[]> => {
-    if (seg_cache.has(seg)) return seg_cache.get(seg)!;
-    const rows = await q.get_mem_by_segment.all(seg);
-    seg_cache.set(seg, rows);
-    if (seg_cache.size > env.cache_segments) {
-        const first = seg_cache.keys().next().value;
-        if (first !== undefined) seg_cache.delete(first);
-    }
-    return rows;
-};
 setInterval(async () => {
     if (!coact_buf.length) return;
     const pairs = coact_buf.splice(0, 50);
@@ -762,23 +702,11 @@ setInterval(async () => {
         } catch (e) { }
     }
 }, 1000);
-const get_sal = async (id: string, def_sal: number): Promise<number> => {
-    const c = sal_cache.get(id);
-    if (c && Date.now() - c.t < TTL) return c.s;
-    const m = await q.get_mem.get(id);
-    const s = m?.salience ?? def_sal;
-    sal_cache.set(id, { s, t: Date.now() });
-    return s;
-};
 export async function hsg_query(
     qt: string,
     k = 10,
     f?: { sectors?: string[]; minSalience?: number; user_id?: string; startTime?: number; endTime?: number; project?: string },
 ): Promise<hsg_q_result[]> {
-
-
-
-
     if (active_queries >= env.max_active) {
         throw new Error(
             `Rate limit: ${active_queries} active queries (max ${env.max_active})`,
@@ -829,11 +757,21 @@ export async function hsg_query(
         const avg_top = all_sims.length
             ? all_sims.reduce((a, b) => a + b, 0) / all_sims.length
             : 0;
-        const adapt_exp = Math.ceil(0.3 * k * (1 - avg_top));
-        const eff_k = k + adapt_exp;
         const high_conf = avg_top >= 0.55;
         const ids = new Set<string>();
         for (const r of Object.values(sr)) for (const x of r) ids.add(x.id);
+        // Lexical recall: exact identifiers, error codes and file names that the
+        // embedding missed still become candidates. Rank-normalised to (0, 1].
+        const lexical = new Map<string, number>();
+        const fts_hits = await q.fts_search.all(fts_terms(qt), k * 3, {
+            user_id: f?.user_id,
+            project: f?.project,
+            sectors: f?.sectors,
+        });
+        fts_hits.forEach((hit, rank) => {
+            lexical.set(hit.id, 1 - rank / fts_hits.length);
+            ids.add(hit.id);
+        });
         const exp = high_conf
             ? []
             : await expand_via_waypoints(Array.from(ids), k * 2, f);
@@ -915,6 +853,7 @@ export async function hsg_query(
                 rec_sc,
                 keyword_boost,
                 tag_match,
+                lexical.get(mid) || 0,
             );
             const msec = await vector_store.getVectorsById(mid);
             const sl = msec.map((v) => v.sector);
@@ -932,20 +871,7 @@ export async function hsg_query(
             });
         }
         res.sort((a, b) => b.score - a.score);
-        const top_cands = res.slice(0, eff_k);
-        if (top_cands.length > 0) {
-            const scores = top_cands.map((r) => r.score);
-            const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
-            const variance =
-                scores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) /
-                scores.length;
-            const stdDev = Math.sqrt(variance);
-            for (const r of top_cands) {
-                r.score = (r.score - mean) / (stdDev + hybrid_params.epsilon);
-            }
-            top_cands.sort((a, b) => b.score - a.score);
-        }
-        const top = top_cands.slice(0, k);
+        const top = res.slice(0, k);
         const tids = top.map((r) => r.id);
 
 
@@ -969,14 +895,10 @@ export async function hsg_query(
             await q.upd_seen.run(r.id, Date.now(), rsal, Date.now());
             if (r.path.length > 1) {
                 await reinforce_waypoints(r.path);
-                const wps = await q.get_waypoints_by_src.all(r.id);
-                const source = await q.get_mem.get(r.id);
-                const lns: Array<{ target_id: string; weight: number }> = [];
-                for (const wp of wps) {
-                    if (same_memory_scope(source, await q.get_mem.get(wp.dst_id))) {
-                        lns.push({ target_id: wp.dst_id, weight: wp.weight });
-                    }
-                }
+                // get_waypoints_by_src only returns same-scope edges.
+                const lns = (await q.get_waypoints_by_src.all(r.id)).map(
+                    (wp: any) => ({ target_id: wp.dst_id, weight: wp.weight }),
+                );
                 const pru =
                     await propagateAssociativeReinforcementToLinkedNodes(
                         r.id,
@@ -985,7 +907,7 @@ export async function hsg_query(
                     );
                 for (const u of pru) {
                     const linked_mem = await q.get_mem.get(u.node_id);
-                    if (same_memory_scope(source, linked_mem)) {
+                    if (linked_mem) {
                         const time_diff =
                             (Date.now() - linked_mem.last_seen_at) / 86400000;
                         const decay_fact = Math.exp(-0.02 * time_diff);

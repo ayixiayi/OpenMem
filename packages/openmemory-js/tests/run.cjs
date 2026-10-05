@@ -17,6 +17,7 @@ try {
         "test_embedding_paths",
         "test_memory_lifecycle",
         "test_decay",
+        "test_hybrid_search",
         "test_auth",
         "test_omnibus",
     ]) {
@@ -49,7 +50,7 @@ try {
             );
         }
     }
-    console.log("[REGRESSION] All 13 offline suites passed");
+    console.log("[REGRESSION] All 14 offline suites passed");
 } finally {
     rmSync(home, { recursive: true, force: true });
 }

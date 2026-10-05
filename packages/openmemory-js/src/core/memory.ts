@@ -1,11 +1,10 @@
 
 import { add_hsg_memory, hsg_query, delete_memory } from "../memory/hsg";
-import { q, log_maint_op } from "./db";
-import { env } from "./cfg";
-import { j } from "../utils";
+import { q } from "./db";
 
 export interface MemoryOptions {
     user_id?: string;
+    project?: string;
     tags?: string[];
     [key: string]: any;
 }
@@ -18,35 +17,21 @@ export class Memory {
     }
 
     async add(content: string, opts?: MemoryOptions) {
-        const uid = opts?.user_id || this.default_user;
-        const tags = opts?.tags || [];
-        const meta = { ...opts };
-        delete meta.user_id;
-        delete meta.tags;
-
-
-
-
-
-
-        const tags_str = JSON.stringify(tags);
-
-
-
-        const res = await add_hsg_memory(content, tags_str, meta, uid ?? undefined);
-        return res;
+        const { user_id, project, tags = [], ...meta } = opts || {};
+        const uid = user_id || this.default_user;
+        return add_hsg_memory(content, JSON.stringify(tags), meta, uid ?? undefined, project);
     }
 
     async get(id: string) {
         return await q.get_mem.get(id);
     }
 
-    async search(query: string, opts?: { user_id?: string, limit?: number, sectors?: string[] }) {
-
+    async search(query: string, opts?: { user_id?: string, project?: string, limit?: number, sectors?: string[] }) {
         const k = opts?.limit || 10;
         const uid = opts?.user_id || this.default_user;
         const f: any = {};
         if (uid) f.user_id = uid;
+        if (opts?.project) f.project = opts.project;
         if (opts?.sectors) f.sectors = opts.sectors;
 
         return await hsg_query(query, k, f);

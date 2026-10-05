@@ -11,6 +11,7 @@ import { PostgresVectorStore } from "./vector/postgres";
 import { ValkeyVectorStore } from "./vector/valkey";
 
 type memory_filters = { user_id?: string; project?: string; sector?: string };
+type fts_filters = { user_id?: string; project?: string; sectors?: string[] };
 
 type q_type = {
     ins_mem: {
@@ -67,27 +68,9 @@ type q_type = {
     all_mem_by_user: {
         all: (user_id: string, limit: number, offset: number) => Promise<any[]>;
     };
-    all_mem_by_project: {
-        all: (project: string, limit: number, offset: number) => Promise<any[]>;
-    };
-    timeline_before: {
-        all: (
-            project: string,
-            created_at: number,
-            limit: number,
-        ) => Promise<any[]>;
-    };
-    timeline_after: {
-        all: (
-            project: string,
-            created_at: number,
-            limit: number,
-        ) => Promise<any[]>;
-    };
-    fts_search: { all: (query: string, limit: number) => Promise<any[]> };
-    count_by_project: { get: (project: string) => Promise<any> };
-    get_oldest_by_project: {
-        all: (project: string, limit: number) => Promise<any[]>;
+    /** Lexical search over memory content; `terms` must be plain word tokens. Best match first. */
+    fts_search: {
+        all: (terms: string[], limit: number, filters?: fts_filters) => Promise<Array<{ id: string }>>;
     };
     get_segment_count: { get: (segment: number) => Promise<any> };
     get_max_segment: { get: () => Promise<any> };
@@ -118,7 +101,6 @@ type q_type = {
     ins_log: { run: (...p: any[]) => Promise<void> };
     upd_log: { run: (status: string, error: string | null, id: string) => Promise<void> };
     get_pending_logs: { all: () => Promise<any[]> };
-    get_failed_logs: { all: () => Promise<any[]> };
     ins_user: { run: (...p: any[]) => Promise<void> };
     get_user: { get: (user_id: string) => Promise<any> };
     upd_user_summary: { run: (user_id: string, summary: string, updated_at: number) => Promise<void> };
@@ -134,6 +116,8 @@ let transaction: {
 let q: q_type;
 let vector_store: VectorStore;
 let memories_table: string;
+let sessions_table: string;
+let summaries_table: string;
 
 async function list_memories(limit: number, offset: number, filters: memory_filters = {}): Promise<any[]> {
     const conditions: string[] = [];
@@ -150,6 +134,18 @@ async function list_memories(limit: number, offset: number, filters: memory_filt
     );
 }
 
+function fts_scope(filters: fts_filters = {}, alias: string) {
+    const conditions: string[] = [];
+    const params: any[] = [];
+    if (filters.user_id) { conditions.push(`${alias}.user_id=?`); params.push(filters.user_id); }
+    if (filters.project) { conditions.push(`${alias}.project=?`); params.push(filters.project); }
+    if (filters.sectors?.length) {
+        conditions.push(`${alias}.primary_sector in (${filters.sectors.map(() => "?").join(",")})`);
+        params.push(...filters.sectors);
+    }
+    return { sql: conditions.map(c => ` and ${c}`).join(""), params };
+}
+
 async function scoped_memory_ids(user_id?: string, project?: string): Promise<string[]> {
     const conditions: string[] = [];
     const params: string[] = [];
@@ -160,7 +156,6 @@ async function scoped_memory_ids(user_id?: string, project?: string): Promise<st
 }
 
 const is_pg = env.metadata_backend === "postgres";
-
 
 function convertPlaceholders(sql: string): string {
     if (!is_pg) return sql;
@@ -193,17 +188,13 @@ if (is_pg) {
     const v = `"${sc}"."${process.env.OM_VECTOR_TABLE || "openmemory_vectors"}"`;
     const w = `"${sc}"."openmemory_waypoints"`;
     const l = `"${sc}"."openmemory_embed_logs"`;
-    const f = `"${sc}"."openmemory_memories_fts"`;
     const s = `"${sc}"."openmemory_sessions"`;
     const sm = `"${sc}"."openmemory_summaries"`;
+    sessions_table = s;
+    summaries_table = sm;
     const exec = async (sql: string, p: any[] = []) => {
         return (await pg_transactions.query(convertPlaceholders(sql), p)).rows;
     };
-    run_async = async (sql, p = []) => {
-        await exec(sql, p);
-    };
-    get_async = async (sql, p = []) => (await exec(sql, p))[0];
-    all_async = async (sql, p = []) => await exec(sql, p);
     transaction = { run: pg_transactions.run };
     let ready = false;
     const wait_ready = () =>
@@ -309,6 +300,9 @@ if (is_pg) {
             `create index if not exists idx_memories_obstype on ${m}(observation_type)`,
         );
         await pg.query(
+            `create index if not exists idx_memories_fts on ${m} using gin(to_tsvector('simple', content))`,
+        );
+        await pg.query(
             `create index if not exists openmemory_vectors_user_idx on ${v}(user_id)`,
         );
         await pg.query(
@@ -329,18 +323,13 @@ if (is_pg) {
         await pg.query(
             `create index if not exists idx_summaries_session on ${sm}(session_id)`,
         );
-        await pg.query(
-            `create index if not exists openmemory_stats_type_idx on "${sc}"."stats"(type)`,
-        );
         await migrate_postgres(pg, sc, m, v);
         ready = true;
-
 
         if (env.vector_backend === "valkey") {
             vector_store = new ValkeyVectorStore(scoped_memory_ids);
             console.error("[DB] Using Valkey VectorStore");
         } else {
-            const vt = process.env.OM_VECTOR_TABLE || "openmemory_vectors";
             vector_store = new PostgresVectorStore({ run_async, get_async, all_async }, v.replace(/"/g, ""), true, m);
             console.error(`[DB] Using Postgres VectorStore with table: ${v}`);
         }
@@ -358,8 +347,6 @@ if (is_pg) {
     };
     get_async = async (sql, p = []) => (await safe_exec(sql, p))[0];
     all_async = async (sql, p = []) => await safe_exec(sql, p);
-    const clean = (s: string) =>
-        s ? s.replace(/"/g, "").replace(/\s+OR\s+/gi, " OR ") : "";
     q = {
         ins_mem: {
             run: (...p) =>
@@ -512,13 +499,6 @@ if (is_pg) {
             all: () =>
                 all_async(`select * from ${l} where status=$1`, ["pending"]),
         },
-        get_failed_logs: {
-            all: () =>
-                all_async(
-                    `select * from ${l} where status=$1 order by ts desc limit 100`,
-                    ["failed"],
-                ),
-        },
         all_mem_by_user: {
             all: (user_id, limit, offset) =>
                 all_async(
@@ -526,42 +506,16 @@ if (is_pg) {
                     [user_id, limit, offset],
                 ),
         },
-        all_mem_by_project: {
-            all: (project, limit, offset) =>
-                all_async(
-                    `select * from ${m} where project=$1 order by created_at desc limit $2 offset $3`,
-                    [project, limit, offset],
-                ),
-        },
-        timeline_before: {
-            all: (project, created_at, limit) =>
-                all_async(
-                    `select * from ${m} where project=$1 and created_at<$2 order by created_at desc limit $3`,
-                    [project, created_at, limit],
-                ),
-        },
-        timeline_after: {
-            all: (project, created_at, limit) =>
-                all_async(
-                    `select * from ${m} where project=$1 and created_at>$2 order by created_at asc limit $3`,
-                    [project, created_at, limit],
-                ),
-        },
         fts_search: {
-            all: async () => [] as any[],
-        },
-        count_by_project: {
-            get: (project) =>
-                get_async(`select count(*) as c from ${m} where project=$1`, [
-                    project,
-                ]),
-        },
-        get_oldest_by_project: {
-            all: (project, limit) =>
-                all_async(
-                    `select id, content, observation_type, primary_sector, salience, tags, meta, created_at from ${m} where project=$1 order by salience asc, created_at asc limit $2`,
-                    [project, limit],
-                ),
+            all: async (terms, limit, filters) => {
+                if (!terms.length) return [];
+                const tsq = terms.join(" | ");
+                const scope = fts_scope(filters, "mem");
+                return all_async(
+                    `select mem.id from ${m} mem where to_tsvector('simple', mem.content) @@ to_tsquery('simple', ?)${scope.sql} order by ts_rank(to_tsvector('simple', mem.content), to_tsquery('simple', ?)) desc limit ?`,
+                    [tsq, ...scope.params, tsq, limit],
+                );
+            },
         },
         ins_session: {
             run: (...p) =>
@@ -658,7 +612,7 @@ if (is_pg) {
             `create trigger if not exists memories_ad after delete on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); end;`,
         );
         db.run(
-            `create trigger if not exists memories_au after update on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); insert into memories_fts(rowid, id, content) values (new.rowid, new.id, new.content); end;`,
+            `create trigger if not exists memories_au after update of content on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); insert into memories_fts(rowid, id, content) values (new.rowid, new.id, new.content); end;`,
         );
         db.run(
             `create table if not exists ${sqlite_vector_table}(id text not null,sector text not null,user_id text,v blob not null,dim integer not null,primary key(id,sector))`,
@@ -758,11 +712,10 @@ if (is_pg) {
         db.run(
             "create index if not exists idx_summaries_session on summaries(session_id)",
         );
-        db.run(
-            "create index if not exists idx_edges_validity on temporal_edges(valid_from,valid_to)",
-        );
     });
     memories_table = "memories";
+    sessions_table = "sessions";
+    summaries_table = "summaries";
     const schema_ready = migrate_sqlite(db);
     void schema_ready.catch(() => {});
     const context = new AsyncLocalStorage<{ active: boolean }>();
@@ -1008,13 +961,6 @@ if (is_pg) {
             all: () =>
                 many("select * from embed_logs where status=?", ["pending"]),
         },
-        get_failed_logs: {
-            all: () =>
-                many(
-                    "select * from embed_logs where status=? order by ts desc limit 100",
-                    ["failed"],
-                ),
-        },
         all_mem_by_user: {
             all: (user_id, limit, offset) =>
                 many(
@@ -1022,44 +968,15 @@ if (is_pg) {
                     [user_id, limit, offset],
                 ),
         },
-        all_mem_by_project: {
-            all: (project, limit, offset) =>
-                many(
-                    "select * from memories where project=? order by created_at desc limit ? offset ?",
-                    [project, limit, offset],
-                ),
-        },
-        timeline_before: {
-            all: (project, created_at, limit) =>
-                many(
-                    "select * from memories where project=? and created_at<? order by created_at desc limit ?",
-                    [project, created_at, limit],
-                ),
-        },
-        timeline_after: {
-            all: (project, created_at, limit) =>
-                many(
-                    "select * from memories where project=? and created_at>? order by created_at asc limit ?",
-                    [project, created_at, limit],
-                ),
-        },
         fts_search: {
-            all: (query, limit) =>
-                many(
-                    `select id, rank from memories_fts where memories_fts match ? order by rank limit ?`,
-                    [query, limit],
-                ),
-        },
-        count_by_project: {
-            get: (project) =>
-                one("select count(*) as c from memories where project=?", [project]),
-        },
-        get_oldest_by_project: {
-            all: (project, limit) =>
-                many(
-                    "select id, content, observation_type, primary_sector, salience, tags, meta, created_at from memories where project=? order by salience asc, created_at asc limit ?",
-                    [project, limit],
-                ),
+            all: async (terms, limit, filters) => {
+                if (!terms.length) return [];
+                const scope = fts_scope(filters, "mem");
+                return many(
+                    `select mem.id from memories_fts join memories mem on mem.rowid=memories_fts.rowid where memories_fts match ?${scope.sql} order by bm25(memories_fts) limit ?`,
+                    [`content : (${terms.map(t => `"${t}"`).join(" OR ")})`, ...scope.params, limit],
+                );
+            },
         },
         ins_session: {
             run: (...p) =>
@@ -1117,9 +1034,7 @@ if (is_pg) {
                 await exec("delete from memories");
                 await exec("delete from waypoints");
                 await exec("delete from users");
-
-                const vec_table = process.env.OM_VECTOR_TABLE || "vectors";
-                await exec(`delete from ${vec_table}`);
+                await exec(`delete from ${sqlite_vector_table}`);
             },
         },
     };
@@ -1139,4 +1054,14 @@ export const log_maint_op = async (
     }
 };
 
-export { q, transaction, all_async, get_async, run_async, memories_table, vector_store };
+export {
+    q,
+    transaction,
+    all_async,
+    get_async,
+    run_async,
+    memories_table,
+    sessions_table,
+    summaries_table,
+    vector_store,
+};
