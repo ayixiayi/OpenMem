@@ -1,11 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 💬 Discussions
-  url: https://github.com/CaviraOSS/openmemory/discussions
-    about: Ask questions and discuss ideas with the community
-  - name: 📖 Documentation
-  url: https://github.com/openmemory/openmemory/wiki
-    about: Check out the project documentation
+    url: https://github.com/ayixiayi/OpenMemory-enhanced/discussions
+    about: Ask questions and discuss ideas
   - name: 🔒 Security Issue
-  url: https://github.com/CaviraOSS/openmemory/security/advisories/new
+    url: https://github.com/ayixiayi/OpenMemory-enhanced/security/advisories/new
     about: Report a security vulnerability privately

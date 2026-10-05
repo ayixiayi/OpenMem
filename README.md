@@ -1,45 +1,48 @@
 # OpenMemory-enhanced
 
-An enhanced fork of [CaviraOSS/OpenMemory](https://github.com/CaviraOSS/OpenMemory), purpose-built for **AI coding agents** that need persistent memory across sessions.
+Long-term memory for **AI coding agents**, served over MCP. Your agent starts
+every session already knowing what it did, decided and learned in this project
+last time, without you repeating it.
 
-OpenMemory provides the engine — HSG vector search, salience decay, SimHash deduplication, temporal facts. This fork adds the features that coding agents actually need: **project scoping**, **session lifecycle**, **typed observations**, and an **agent protocol** (SKILL.md) that tells the agent exactly when and how to use memory.
+- **One call to wake up.** `openmemory_wakeup(project)` returns the project's
+  most important memories, grouped by type, plus the last few session summaries,
+  in a compact block.
+- **Scoped by project and user.** Every memory, session and summary carries a
+  `project`. Filters apply *before* ranking in vector, full-text and graph
+  retrieval, so one repository's memories never crowd out or leak into another's.
+- **Hybrid recall that finds identifiers.** Embedding similarity, SQLite FTS5 /
+  Postgres full-text matches and associative waypoints are fused into one score.
+  An exact `ECONNRESET`, file name or config key is recalled even when the
+  embedding misses it.
+- **Offline by default.** SQLite plus built-in synthetic embeddings: no API key,
+  no external service. Switch to OpenAI, Gemini, Ollama or AWS embeddings, or to
+  Postgres + pgvector, with environment variables.
+- **A protocol, not just tools.** [`SKILL.md`](packages/openmemory-js/SKILL.md)
+  tells the agent when to wake up, what to store, when to search and how to
+  close a session.
 
-## What This Fork Adds
+## MCP tools
 
-| Feature | Upstream | This Fork |
-|---|---|---|
-| Project scoping | ❌ Flat namespace | ✅ `project` column — memories partitioned per-project |
-| Session lifecycle | ❌ No session concept | ✅ `sessions` + `summaries` tables, `openmemory_summarize` tool |
-| Observation types | ❌ Generic content | ✅ `observation_type` field (bugfix / decision / discovery / feature / gotcha / refactor) |
-| Timeline queries | ❌ No chronological browsing | ✅ `openmemory_timeline` tool — get memories before/after an anchor |
-| Session ID tracking | ❌ Not on memories | ✅ `session_id` on every memory — trace back to the conversation |
-| Agent protocol | ❌ Generic MCP tools | ✅ SKILL.md with explicit session start/save/summarize protocol |
-
-Everything from upstream is preserved: HSG engine, multi-provider embeddings (OpenAI / Gemini / Ollama / AWS / synthetic), SQLite + Postgres backends, temporal facts, waypoints, decay.
-
-## MCP Tools
-
-8 tools exposed via stdio MCP transport:
-
-| Tool | Description |
+| Tool | Purpose |
 |---|---|
-| `openmemory_store` | Save a memory with project, session, and observation type |
-| `openmemory_query` | Vector + keyword search, scoped to a project |
-| `openmemory_list` | List recent memories, optionally filtered by project |
-| `openmemory_get` | Fetch full details of a specific memory |
-| `openmemory_delete` | Remove a memory by ID |
-| `openmemory_reinforce` | Boost a memory's salience score |
-| `openmemory_summarize` | Save a session summary (what was done, learned, next steps) |
-| `openmemory_timeline` | Get chronological context around a specific memory |
+| `openmemory_wakeup` | Session start: top memories by type + recent session summaries for a project |
+| `openmemory_store` | Save an observation with `project`, `session_id`, `observation_type`, tags and metadata (optionally temporal facts) |
+| `openmemory_query` | Scoped hybrid search (vector + full-text + waypoints); optional temporal fact lookup |
+| `openmemory_summarize` | Save a session summary: request, completed, learned, next steps, files |
+| `openmemory_timeline` | Memories before and after an anchor memory, in order |
+| `openmemory_consolidate` | Report whether a project needs consolidation and return low-value candidates |
+| `openmemory_list` | Recent memories, filtered by project, user and sector |
+| `openmemory_get` | One memory in full |
+| `openmemory_reinforce` | Boost a memory's salience |
+| `openmemory_delete` | Delete a memory |
+| `openmemory_status` | Counts by project/type/sector, embedding config and the usage protocol |
+
+Observation types: `observation`, `bugfix`, `decision`, `discovery`, `feature`,
+`gotcha`, `refactor`.
 
 ## Setup
 
-### Prerequisites
-
-- Node.js 20+
-- An MCP-compatible AI coding agent ([opencode](https://opencode.ai), Claude Code, etc.)
-
-### Install
+Requires Node.js 20+.
 
 ```bash
 git clone https://github.com/ayixiayi/OpenMemory-enhanced.git
@@ -48,14 +51,20 @@ npm install
 npm run build
 ```
 
-### Register as MCP Server
+Register the stdio server with your agent.
 
-For **opencode**, add to `~/.config/opencode/opencode.json`:
+**Claude Code**
+
+```bash
+claude mcp add openmemory -- node /path/to/OpenMemory-enhanced/packages/openmemory-js/dist/ai/mcp.js
+```
+
+**opencode** (`~/.config/opencode/opencode.json`)
 
 ```json
 {
   "mcp": {
-    "opencode-mem": {
+    "openmemory": {
       "type": "local",
       "command": ["node", "/path/to/OpenMemory-enhanced/packages/openmemory-js/dist/ai/mcp.js"],
       "enabled": true,
@@ -65,68 +74,75 @@ For **opencode**, add to `~/.config/opencode/opencode.json`:
 }
 ```
 
-For **Claude Code** or other MCP clients, point the stdio transport to:
+Then give the agent the protocol: copy
+[`packages/openmemory-js/SKILL.md`](packages/openmemory-js/SKILL.md) into its
+skills directory (for Claude Code, `~/.claude/skills/openmemory/SKILL.md`), or
+paste it into your agent instructions.
+
+Optional: put a few lines about yourself or your conventions in
+`~/.openmemory-enhanced/identity.txt`; wakeup prepends them.
+
+## How a session looks
 
 ```
-node /path/to/OpenMemory-enhanced/packages/openmemory-js/dist/ai/mcp.js
+Session 1 — project "my-app"
+  → openmemory_wakeup("my-app")                       ← "new project"
+  → openmemory_store("Chose JWT over server sessions: the API is stateless
+       behind a load balancer", project: "my-app", observation_type: "decision")
+  → openmemory_summarize(project: "my-app", completed: "JWT auth", learned: …)
+
+Session 2 — new conversation, same project
+  → openmemory_wakeup("my-app")
+  ← ## Essential Context (1 memories)
+    [DECISION]
+    - Chose JWT over server sessions: the API is stateless behind a load balancer
+    ## Recent Sessions (1)
+    Session: Add authentication
+      Done: JWT auth
+      Next: refresh-token rotation
 ```
 
-No API keys required — defaults to `synthetic` embeddings that work fully offline. Set `OM_EMBEDDINGS=openai` and `OPENAI_API_KEY=...` for higher quality vector search.
+## Retrieval pipeline
 
-### Add Agent Protocol (Optional)
-
-Copy `packages/openmemory-js/SKILL.md` (or the version in this repo's root) into your agent's skill directory. This tells the agent:
-
-1. **Session start** → query recent project memories silently
-2. **During work** → save observations with type, project, session
-3. **Session end** → save a summary of what was done and learned
-
-## How It Works
-
-```
-Session 1 (project: my-app)
-  Agent works on auth feature
-  → openmemory_store(content: "Chose JWT over sessions because...",
-      project: "my-app", observation_type: "decision")
-  → openmemory_summarize(project: "my-app", completed: "JWT auth", learned: "...")
-
-Session 2 (project: my-app, new conversation)
-  → openmemory_query(query: "recent work", project: "my-app")
-  ← "Last session: implemented JWT auth. Decision: chose JWT because..."
-  Agent has full context without the user repeating anything.
-```
-
-Memories are stored in SQLite at `~/.openmemory-js/data/openmemory.sqlite` (configurable via `OM_DB_PATH`).
-
-## Schema (Added Tables)
-
-```sql
--- New columns on memories table
-project text default 'default'
-session_id text
-observation_type text default 'observation'
-
--- New tables
-sessions(id, project, started_at, ended_at, user_goal, user_id)
-summaries(id, session_id, project, request, completed, learned, next_steps, files_modified, created_at)
-```
+1. The query is embedded per memory sector and searched within the
+   user/project scope.
+2. Full-text search (FTS5 BM25 on SQLite, `tsvector` + GIN on Postgres) adds
+   scoped lexical candidates; the query is tokenised first, so punctuation and
+   operators are safe.
+3. Low-confidence result sets are expanded along same-scope waypoint edges.
+4. Each candidate gets one score in `[0, 1)` from vector similarity, token and
+   tag overlap, full-text rank, waypoint weight and recency. `min_score`
+   thresholds therefore mean the same thing for every query.
+5. Recalled memories are reinforced; unused ones decay by sector-specific rates.
 
 ## Configuration
 
-All settings via environment variables (no `.env` file required):
+All settings are environment variables; none are required.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OM_TIER` | `hybrid` | Performance tier: `fast` / `smart` / `deep` / `hybrid` |
-| `OM_EMBEDDINGS` | `synthetic` | Embedding provider: `synthetic` / `openai` / `gemini` / `ollama` / `aws` |
-| `OM_DB_PATH` | `~/.openmemory-js/data/openmemory.sqlite` | SQLite database path |
-| `OM_VEC_DIM` | `1536` | Vector dimensions |
-| `OPENAI_API_KEY` | — | Required only if `OM_EMBEDDINGS=openai` |
+| `OM_DB_PATH` | `packages/openmemory-js/data/openmemory.sqlite` | SQLite database file |
+| `OM_EMBEDDINGS` | `synthetic` | `synthetic`, `openai`, `gemini`, `ollama`, `aws` |
+| `OPENAI_API_KEY` | — | Needed for `OM_EMBEDDINGS=openai` |
+| `OM_TIER` | `hybrid` | `hybrid` / `fast` (synthetic), `smart` (synthetic + compressed semantic), `deep` (semantic) |
+| `OM_METADATA_BACKEND` | `sqlite` | `sqlite` or `postgres` (`OM_PG_HOST`, `OM_PG_DB`, …) |
+| `OM_VECTOR_BACKEND` | follows metadata | `valkey` to keep vectors in Valkey/Redis |
 
-## Upstream
+See [`.env.example`](.env.example) for the full list. Schema upgrades run
+automatically on startup; see [MIGRATION.md](MIGRATION.md) before upgrading an
+existing database.
 
-Forked from [CaviraOSS/OpenMemory](https://github.com/CaviraOSS/OpenMemory). See upstream for the full OpenMemory documentation, Python SDK, VS Code extension, and deployment options.
+## Development
 
-## License
+```bash
+cd packages/openmemory-js
+npx tsc --noEmit
+npm test          # offline: in-memory SQLite + synthetic embeddings
+```
 
-[Apache-2.0](LICENSE) (same as upstream)
+## Origins and license
+
+This project began as a fork of
+[CaviraOSS/OpenMemory](https://github.com/CaviraOSS/OpenMemory) and is now
+developed independently; its HSG engine, decay model and temporal facts derive
+from that work. Licensed under [Apache-2.0](LICENSE); see [NOTICE](NOTICE).
