@@ -806,7 +806,6 @@ Query `embed_logs` table for:
 ## References
 
 - [README.md](./README.md) - Getting started
-- [Why.md](./Why.md) - Architectural rationale
 - [CONTRIBUTING.md](./CONTRIBUTING.md) - Development guide
 - [SECURITY.md](./SECURITY.md) - Security policy
-- [API Documentation](./docs/api-server.md) - Endpoint details
+- [MIGRATION.md](./MIGRATION.md) - Upgrade notes

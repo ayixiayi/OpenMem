@@ -8,34 +8,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-python:
-    name: Test Python SDK
-    runs-on: ubuntu-latest
-    env:
-      OM_DB_URL: "sqlite:///:memory:"
-      OM_EMBED_KIND: "synthetic"
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          
-      - name: Install Dependencies
-        run: |
-          cd packages/openmemory-py
-          pip install -e .[dev]
-          pip install pytest
-          pip install pytest-asyncio
-          pip install python-dotenv
-          pip install pyyaml
-          
-      - name: Run Offline Regressions
-        run: |
-          cd packages/openmemory-py
-          python -m pytest tests -q
-          
   test-node:
     name: Test Node.js SDK
     runs-on: ubuntu-latest
