@@ -133,6 +133,29 @@ export async function migrate_sqlite(db: sqlite3.Database): Promise<void> {
             await run("alter table vectors add column provenance text");
             await run("insert into _om_migrations values(2)");
         }
+        if (
+            !(await all("select version from _om_migrations where version=3"))
+                .length
+        ) {
+            // Rows written before memories_fts existed were never indexed, and the
+            // old trigger rewrote the index on every salience/feedback update.
+            if (
+                (
+                    await all(
+                        "select name from sqlite_master where name='memories_fts'",
+                    )
+                ).length
+            ) {
+                await run("drop trigger if exists memories_au");
+                await run(
+                    "create trigger memories_au after update of content on memories begin insert into memories_fts(memories_fts, rowid, id, content) values ('delete', old.rowid, old.id, old.content); insert into memories_fts(rowid, id, content) values (new.rowid, new.id, new.content); end",
+                );
+                await run(
+                    "insert into memories_fts(memories_fts) values('rebuild')",
+                );
+            }
+            await run("insert into _om_migrations values(3)");
+        }
         await run("COMMIT");
     } catch (error) {
         await run("ROLLBACK");

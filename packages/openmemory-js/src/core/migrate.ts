@@ -300,3 +300,10 @@ export async function run_migrations() {
 
     log("All migrations completed");
 }
+
+if (require.main === module) {
+    run_migrations().catch((error) => {
+        console.error("[MIGRATE] Failed:", error);
+        process.exitCode = 1;
+    });
+}

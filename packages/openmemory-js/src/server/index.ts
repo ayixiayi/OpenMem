@@ -9,7 +9,6 @@ import {
 } from "./middleware/auth";
 import { start_reflection } from "../memory/reflect";
 import { start_user_summary_reflection } from "../memory/user_summary";
-import { sendTelemetry } from "../core/telemetry";
 import { req_tracker_mw } from "./routes/dashboard";
 
 const ASC = `   ____                   __  __
@@ -114,7 +113,4 @@ start_user_summary_reflection();
 console.log(`[SERVER] Starting on port ${env.port}`);
 app.listen(env.port, () => {
     console.log(`[SERVER] Running on http://localhost:${env.port}`);
-    sendTelemetry().catch(() => {
-
-    });
 });

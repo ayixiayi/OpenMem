@@ -68,4 +68,4 @@ with additional customization for the **OpenMemory** open-source community.
 
 ---
 
-_Maintained by "nullure" for the OpenMemory Project._
+_Maintained for the OpenMemory-enhanced project._

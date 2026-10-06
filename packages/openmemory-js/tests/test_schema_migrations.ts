@@ -126,6 +126,7 @@ async function main() {
         assert.deepEqual(await f.all("select * from _om_migrations"), [
             { version: 1 },
             { version: 2 },
+            { version: 3 },
         ]);
         assert.deepEqual(
             await f.all(

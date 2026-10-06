@@ -1,4 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -11,7 +14,15 @@ import {
     delete_memory,
     sector_configs,
 } from "../memory/hsg";
-import { q, all_async, memories_table, vector_store, transaction } from "../core/db";
+import {
+    q,
+    all_async,
+    memories_table,
+    sessions_table,
+    summaries_table,
+    vector_store,
+    transaction,
+} from "../core/db";
 import { getEmbeddingInfo } from "../memory/embed";
 import { j, p } from "../utils";
 import type { sector_type, mem_row, rpc_err_code } from "../core/types";
@@ -19,6 +30,8 @@ import { update_user_summary } from "../memory/user_summary";
 import { insert_fact } from "../temporal_graph/store";
 import { query_facts_at_time } from "../temporal_graph/query";
 import { ToolRegistry } from "./mcp_tools";
+
+const SERVER_VERSION = "2.1.0";
 
 const sec_enum = z.enum([
     "episodic",
@@ -83,8 +96,8 @@ const uid = (val?: string | null) => (val?.trim() ? val.trim() : undefined);
 export const create_mcp_srv = () => {
     const srv = new McpServer(
         {
-            name: "openmemory-mcp",
-            version: "2.1.0",
+            name: "openmemory-enhanced",
+            version: SERVER_VERSION,
         },
         { capabilities: { tools: {}, resources: {}, logging: {} } },
     );
@@ -183,7 +196,6 @@ export const create_mcp_srv = () => {
             const results: any = { type, query };
             const at_date = at ? new Date(at) : new Date();
 
-
             if (type === "contextual" || type === "unified") {
                 const flt =
                     sector || min_salience !== undefined || u || proj
@@ -197,24 +209,8 @@ export const create_mcp_srv = () => {
                         }
                         : undefined;
 
+                // hsg_query fuses vector, lexical (FTS) and graph evidence.
                 let matches = await hsg_query(query, k ?? 8, flt);
-
-                // BM25 hybrid: boost vector results that also match FTS5
-                if (matches.length > 0) {
-                    try {
-                        const fts_hits = await q.fts_search.all(query, 50);
-                        if (fts_hits.length > 0) {
-                            const fts_ids = new Set(fts_hits.map((h: any) => h.id));
-                            for (const m of matches) {
-                                if (fts_ids.has(m.id)) {
-                                    (m as any).score = Math.min(1.0, m.score * 1.15);
-                                }
-                            }
-                            matches.sort((a: any, b: any) => b.score - a.score);
-                        }
-                    } catch { /* FTS5 not available (Postgres), skip */ }
-                }
-
                 if (min_score !== undefined) {
                     matches = matches.filter((m: any) => m.score >= min_score);
                 }
@@ -781,7 +777,6 @@ export const create_mcp_srv = () => {
             };
         },
     );
-    // ── openmemory_status (self-teaching: embeds protocol + stats in response) ──
     registry.tool(
         "openmemory_consolidate",
         "Check if a project's memories need consolidation and return the lowest-value candidates for merging. Call this periodically to prevent memory bloat. The agent should review the candidates, synthesize them into fewer high-quality memories via openmemory_store, then delete the originals via openmemory_delete.",
@@ -856,6 +851,7 @@ export const create_mcp_srv = () => {
         },
     );
 
+    // Self-teaching: embeds the usage protocol and stats in the response.
     registry.tool(
         "openmemory_status",
         "Get memory system status, statistics, and usage protocol. Call this on wake-up to learn how to use the memory system.",
@@ -879,11 +875,11 @@ export const create_mcp_srv = () => {
             );
 
             const summary_count = await all_async(
-                `select count(*) as c from summaries`,
+                `select count(*) as c from ${summaries_table}`,
             );
 
             const session_count = await all_async(
-                `select count(*) as c from sessions`,
+                `select count(*) as c from ${sessions_table}`,
             );
 
             const protocol = `MEMORY PROTOCOL:
@@ -901,27 +897,15 @@ export const create_mcp_srv = () => {
 7. CONSOLIDATION: When openmemory_wakeup shows many memories, call openmemory_consolidate(project) to check if consolidation is needed. If yes, synthesize low-value memories into fewer high-quality ones, then delete originals.`;
 
             const pay = {
-                total_memories: total,
-                total_summaries: summary_count?.[0]?.c ?? 0,
-                total_sessions: session_count?.[0]?.c ?? 0,
+                total_memories: Number(total),
+                total_summaries: Number(summary_count?.[0]?.c ?? 0),
+                total_sessions: Number(session_count?.[0]?.c ?? 0),
                 by_sector,
                 by_project,
                 by_observation_type: by_type,
                 embeddings: getEmbeddingInfo(),
                 protocol,
-                available_tools: [
-                    "openmemory_status",
-                    "openmemory_wakeup",
-                    "openmemory_query",
-                    "openmemory_store",
-                    "openmemory_consolidate",
-                    "openmemory_summarize",
-                    "openmemory_timeline",
-                    "openmemory_list",
-                    "openmemory_get",
-                    "openmemory_reinforce",
-                    "openmemory_delete",
-                ],
+                available_tools: registry.names(),
             };
 
             return {
@@ -957,13 +941,9 @@ export const create_mcp_srv = () => {
             // L0: Identity (static, optional)
             let identity = "";
             try {
-                const fs = await import("fs");
-                const path = await import("path");
-                const os = await import("os");
-                const id_path = path.join(os.homedir(), ".openmemory-enhanced", "identity.txt");
-                if (fs.existsSync(id_path)) {
-                    identity = fs.readFileSync(id_path, "utf-8").trim();
-                }
+                identity = fs
+                    .readFileSync(path.join(os.homedir(), ".openmemory-enhanced", "identity.txt"), "utf-8")
+                    .trim();
             } catch { /* no identity file, that's fine */ }
 
             // L1: Top-N memories by salience, project-scoped
@@ -1043,19 +1023,8 @@ export const create_mcp_srv = () => {
                 sectors: sector_configs,
                 stats,
                 embeddings: getEmbeddingInfo(),
-                server: { version: "2.1.0", protocol: "2025-06-18" },
-                available_tools: [
-                    "openmemory_status",
-                    "openmemory_wakeup",
-                    "openmemory_query",
-                    "openmemory_store",
-                    "openmemory_reinforce",
-                    "openmemory_list",
-                    "openmemory_get",
-                    "openmemory_delete",
-                    "openmemory_summarize",
-                    "openmemory_timeline",
-                ],
+                server: { version: SERVER_VERSION, protocol: "2025-06-18" },
+                available_tools: registry.names(),
             };
             return {
                 contents: [
