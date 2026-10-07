@@ -1,7 +1,7 @@
 import path from "path";
 import dotenv from "dotenv";
 
-dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 const num = (v: string | undefined, d: number) => Number(v) || d;
 const str = (v: string | undefined, d: string) => v || d;
 const bool = (v: string | undefined) => v === "true";
@@ -11,7 +11,7 @@ const get_tier = (): tier => {
     const man = process.env.OM_TIER as tier;
     if (man && ["fast", "smart", "deep", "hybrid"].includes(man)) return man;
     console.warn(
-        "[OpenMemory] OM_TIER not set! Please set OM_TIER=hybrid|fast|smart|deep in .env",
+        "[OpenMem] OM_TIER not set! Please set OM_TIER=hybrid|fast|smart|deep in .env",
     );
     return "hybrid";
 };

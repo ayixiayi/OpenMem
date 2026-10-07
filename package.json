@@ -1,23 +1,22 @@
 {
-    "name": "openmemory-enhanced",
+    "name": "openmem-mcp",
     "version": "2.1.0",
     "author": "ayixiayi",
     "description": "Project-scoped, session-aware long-term memory MCP server for AI coding agents. Works fully offline.",
     "license": "Apache-2.0",
     "repository": {
         "type": "git",
-        "url": "https://github.com/ayixiayi/OpenMemory-enhanced.git",
-        "directory": "packages/openmemory-js"
+        "url": "https://github.com/ayixiayi/OpenMem.git"
     },
     "bin": {
-        "opm": "./bin/opm.js",
-        "openmemory-enhanced": "./bin/opm.js"
+        "openmem": "./bin/opm.js",
+        "opm": "./bin/opm.js"
     },
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "scripts": {
         "dev": "nodemon src/server/index.ts",
-        "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+        "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
         "build": "tsc -p tsconfig.json",
         "test": "node tests/run.cjs",
         "start": "node dist/server/index.js",

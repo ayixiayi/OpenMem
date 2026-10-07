@@ -56,13 +56,29 @@ external endpoint on startup; `OM_TELEMETRY` is ignored.
 transactions are rejected. Outside a callback, PostgreSQL queries use the pool
 and SQLite queries are serialised through the same gate as transactions.
 
-## Earlier upstream migration (v1.1 → v1.2 multi-user)
+## Moving from OpenMemory-enhanced
+
+The project is now **OpenMem** (`ayixiayi/OpenMem`, npm package `openmem-mcp`),
+and the package lives at the repository root instead of `packages/openmemory-js`.
+MCP tool names (`openmemory_*`), environment variables and the database schema
+are unchanged.
+
+1. **Keep your data.** The default SQLite file moved from
+   `packages/openmemory-js/data/openmemory.sqlite` to `data/openmemory.sqlite`.
+   Copy the old file there, or point `OM_DB_PATH` at it.
+2. **Update the MCP server path** in your agent config to
+   `/path/to/OpenMem/dist/ai/mcp.js`. The server now reports its name as
+   `openmem`.
+3. **Identity file:** `~/.openmem/identity.txt` is read first;
+   `~/.openmemory-enhanced/identity.txt` still works as a fallback.
+4. A `.env` file is now read from the repository root.
+
+## Legacy v1.1 databases
 
 Databases created by OpenMemory v1.1 or earlier need the multi-user columns
 before the migrations above can run:
 
 ```bash
-cd packages/openmemory-js
 npm run migrate
 ```
 

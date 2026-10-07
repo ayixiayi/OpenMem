@@ -5,7 +5,7 @@ const path = require('path');
 
 // load .env from root
 const loadenv = () => {
-  const envp = path.join(__dirname, '..', '..', '.env');
+  const envp = path.join(__dirname, '..', '.env');
   if (!fs.existsSync(envp)) return;
   const lns = fs.readFileSync(envp, 'utf8').split('\n');
   for (const ln of lns) {
@@ -24,7 +24,7 @@ const url = process.env.OPENMEMORY_URL || `http://localhost:${port}`;
 const key = process.env.OPENMEMORY_API_KEY || process.env.OM_API_KEY || '';
 
 const helptext = `
-openmemory cli (opm)
+openmem cli (openmem | opm)
 
 usage: opm <command> [options]
 

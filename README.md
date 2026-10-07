@@ -1,4 +1,4 @@
-# OpenMemory-enhanced
+# OpenMem
 
 Long-term memory for **AI coding agents**, served over MCP. Your agent starts
 every session already knowing what it did, decided and learned in this project
@@ -17,7 +17,7 @@ last time, without you repeating it.
 - **Offline by default.** SQLite plus built-in synthetic embeddings: no API key,
   no external service. Switch to OpenAI, Gemini, Ollama or AWS embeddings, or to
   Postgres + pgvector, with environment variables.
-- **A protocol, not just tools.** [`SKILL.md`](packages/openmemory-js/SKILL.md)
+- **A protocol, not just tools.** [`SKILL.md`](SKILL.md)
   tells the agent when to wake up, what to store, when to search and how to
   close a session.
 
@@ -45,8 +45,8 @@ Observation types: `observation`, `bugfix`, `decision`, `discovery`, `feature`,
 Requires Node.js 20+.
 
 ```bash
-git clone https://github.com/ayixiayi/OpenMemory-enhanced.git
-cd OpenMemory-enhanced/packages/openmemory-js
+git clone https://github.com/ayixiayi/OpenMem.git
+cd OpenMem
 npm install
 npm run build
 ```
@@ -56,7 +56,7 @@ Register the stdio server with your agent.
 **Claude Code**
 
 ```bash
-claude mcp add openmemory -- node /path/to/OpenMemory-enhanced/packages/openmemory-js/dist/ai/mcp.js
+claude mcp add openmem -- node /path/to/OpenMem/dist/ai/mcp.js
 ```
 
 **opencode** (`~/.config/opencode/opencode.json`)
@@ -64,9 +64,9 @@ claude mcp add openmemory -- node /path/to/OpenMemory-enhanced/packages/openmemo
 ```json
 {
   "mcp": {
-    "openmemory": {
+    "openmem": {
       "type": "local",
-      "command": ["node", "/path/to/OpenMemory-enhanced/packages/openmemory-js/dist/ai/mcp.js"],
+      "command": ["node", "/path/to/OpenMem/dist/ai/mcp.js"],
       "enabled": true,
       "timeout": 15000
     }
@@ -74,13 +74,12 @@ claude mcp add openmemory -- node /path/to/OpenMemory-enhanced/packages/openmemo
 }
 ```
 
-Then give the agent the protocol: copy
-[`packages/openmemory-js/SKILL.md`](packages/openmemory-js/SKILL.md) into its
-skills directory (for Claude Code, `~/.claude/skills/openmemory/SKILL.md`), or
-paste it into your agent instructions.
+Then give the agent the protocol: copy [`SKILL.md`](SKILL.md) into its skills
+directory (for Claude Code, `~/.claude/skills/openmem/SKILL.md`), or paste it
+into your agent instructions.
 
 Optional: put a few lines about yourself or your conventions in
-`~/.openmemory-enhanced/identity.txt`; wakeup prepends them.
+`~/.openmem/identity.txt`; wakeup prepends them.
 
 ## How a session looks
 
@@ -121,7 +120,7 @@ All settings are environment variables; none are required.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OM_DB_PATH` | `packages/openmemory-js/data/openmemory.sqlite` | SQLite database file |
+| `OM_DB_PATH` | `data/openmemory.sqlite` (in the repo) | SQLite database file |
 | `OM_EMBEDDINGS` | `synthetic` | `synthetic`, `openai`, `gemini`, `ollama`, `aws` |
 | `OPENAI_API_KEY` | — | Needed for `OM_EMBEDDINGS=openai` |
 | `OM_TIER` | `hybrid` | `hybrid` / `fast` (synthetic), `smart` (synthetic + compressed semantic), `deep` (semantic) |
@@ -135,14 +134,21 @@ existing database.
 ## Development
 
 ```bash
-cd packages/openmemory-js
 npx tsc --noEmit
 npm test          # offline: in-memory SQLite + synthetic embeddings
 ```
 
-## Origins and license
+`npm start` runs the optional HTTP API (port `OM_PORT`, default 8080), which
+also serves MCP at `POST /mcp`. The package can be used as a library too:
 
-This project began as a fork of
-[CaviraOSS/OpenMemory](https://github.com/CaviraOSS/OpenMemory) and is now
-developed independently; its HSG engine, decay model and temporal facts derive
-from that work. Licensed under [Apache-2.0](LICENSE); see [NOTICE](NOTICE).
+```typescript
+import { Memory } from "openmem-mcp";
+
+const mem = new Memory("user-123");
+await mem.add("Chose JWT over server sessions", { project: "my-app", tags: ["auth"] });
+const hits = await mem.search("auth decision", { project: "my-app", limit: 5 });
+```
+
+## License
+
+[Apache-2.0](LICENSE). See [NOTICE](NOTICE).

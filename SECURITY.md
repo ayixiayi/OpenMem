@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-We take the security of OpenMemory seriously. If you believe you have found a security vulnerability, please report it to us as described below.
+We take the security of OpenMem seriously. If you believe you have found a security vulnerability, please report it to us as described below.
 
 ### Where to Report
 
@@ -11,7 +11,7 @@ We take the security of OpenMemory seriously. If you believe you have found a se
 Instead, please report them via one of the following methods:
 
 1. **Email**: Send an email to bob@holacorp.net
-2. **GitHub Security Advisories**: Use the [GitHub Security Advisory](https://github.com/ayixiayi/OpenMemory-enhanced/security/advisories) feature
+2. **GitHub Security Advisories**: Use the [GitHub Security Advisory](https://github.com/ayixiayi/OpenMem/security/advisories) feature
 3. **Private disclosure**: Contact maintainers directly for sensitive issues
 
 ### What to Include
@@ -21,7 +21,7 @@ Please include the following information in your report:
 - **Description**: A clear description of the vulnerability
 - **Impact**: The potential impact of the vulnerability
 - **Reproduction**: Step-by-step instructions to reproduce the issue
-- **Affected versions**: Which versions of OpenMemory are affected
+- **Affected versions**: Which versions of OpenMem are affected
 - **Suggested fix**: If you have suggestions for how to fix the issue
 - **Your contact information**: So we can follow up with questions
 
@@ -50,10 +50,10 @@ We aim to respond to security reports within the following timeframes:
 
 - **Authentication**: Always use authentication in production
 - **HTTPS**: Use HTTPS/TLS for all communications
-- **Network isolation**: Run OpenMemory behind a firewall
-- **Regular updates**: Keep OpenMemory updated to the latest version
+- **Network isolation**: Run OpenMem behind a firewall
+- **Regular updates**: Keep OpenMem updated to the latest version
 - **Environment variables**: Store sensitive configuration in environment variables
-- **Access control**: Limit access to the OpenMemory server
+- **Access control**: Limit access to the OpenMem server
 
 #### API Key Security
 
@@ -97,4 +97,4 @@ We aim to respond to security reports within the following timeframes:
 
 If you have any questions about this security policy, please contact us at security@cavira.app or create a GitHub discussion.
 
-Thank you for helping keep OpenMemory and our users safe!
+Thank you for helping keep OpenMem and our users safe!

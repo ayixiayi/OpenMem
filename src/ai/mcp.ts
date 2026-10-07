@@ -96,7 +96,7 @@ const uid = (val?: string | null) => (val?.trim() ? val.trim() : undefined);
 export const create_mcp_srv = () => {
     const srv = new McpServer(
         {
-            name: "openmemory-enhanced",
+            name: "openmem",
             version: SERVER_VERSION,
         },
         { capabilities: { tools: {}, resources: {}, logging: {} } },
@@ -940,11 +940,13 @@ export const create_mcp_srv = () => {
 
             // L0: Identity (static, optional)
             let identity = "";
-            try {
-                identity = fs
-                    .readFileSync(path.join(os.homedir(), ".openmemory-enhanced", "identity.txt"), "utf-8")
-                    .trim();
-            } catch { /* no identity file, that's fine */ }
+            // ~/.openmemory-enhanced is the pre-rename location.
+            for (const dir of [".openmem", ".openmemory-enhanced"]) {
+                try {
+                    identity = fs.readFileSync(path.join(os.homedir(), dir, "identity.txt"), "utf-8").trim();
+                    break;
+                } catch { /* optional */ }
+            }
 
             // L1: Top-N memories by salience, project-scoped
             const top_memories = await all_async(

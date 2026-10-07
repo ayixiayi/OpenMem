@@ -9,9 +9,6 @@ on:
 jobs:
   publish-js:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: packages/openmemory-js
     steps:
       - uses: actions/checkout@v4
 

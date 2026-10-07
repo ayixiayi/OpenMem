@@ -1,8 +1,8 @@
-# OpenMemory Code of Conduct
+# OpenMem Code of Conduct
 
 ## Our Pledge
 
-We, as members, contributors, and maintainers of **OpenMemory**, pledge to make participation in our community a harassment-free experience for everyone — regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity or expression, education, experience level, nationality, personal appearance, race, religion, or sexual identity and orientation.
+We, as members, contributors, and maintainers of **OpenMem**, pledge to make participation in our community a harassment-free experience for everyone — regardless of age, body size, visible or invisible disability, ethnicity, sex characteristics, gender identity or expression, education, experience level, nationality, personal appearance, race, religion, or sexual identity and orientation.
 
 We commit to acting and interacting in ways that contribute to an open, friendly, diverse, and healthy community.
 
@@ -64,8 +64,8 @@ Maintainers are obligated to respect the privacy and security of the reporter of
 ## Attribution
 
 This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/version/2/1/code_of_conduct.html), version 2.1,  
-with additional customization for the **OpenMemory** open-source community.
+with additional customization for the **OpenMem** open-source community.
 
 ---
 
-_Maintained for the OpenMemory-enhanced project._
+_Maintained for the OpenMem project._

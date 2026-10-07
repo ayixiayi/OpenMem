@@ -1,9 +1,9 @@
 ---
-name: openmemory
-description: Persistent, project-scoped memory across coding sessions via the OpenMemory-enhanced MCP server. Use at the start of every session, after meaningful progress, when the user refers to past work, and before ending a session.
+name: openmem
+description: Persistent, project-scoped memory across coding sessions via the OpenMem MCP server. Use at the start of every session, after meaningful progress, when the user refers to past work, and before ending a session.
 ---
 
-# OpenMemory protocol
+# OpenMem protocol
 
 `project` is always the basename of the working directory (`home` for the home
 directory). Pass the same `project` to every call. Do all of this silently;

@@ -1,5 +1,5 @@
 /**
- * web crawler source for openmemory - production grade
+ * web crawler source for openmem - production grade
  * requires: cheerio (for html parsing)
  * no auth required for public urls
  */
@@ -65,7 +65,7 @@ export class web_crawler_source extends base_source {
                 const timeout_id = setTimeout(() => controller.abort(), this.timeout);
 
                 const resp = await fetch(url, {
-                    headers: { 'User-Agent': 'OpenMemory-Crawler/1.0 (compatible)' },
+                    headers: { 'User-Agent': 'OpenMem-Crawler/1.0 (compatible)' },
                     signal: controller.signal
                 });
 
@@ -126,7 +126,7 @@ export class web_crawler_source extends base_source {
         const timeout_id = setTimeout(() => controller.abort(), this.timeout);
 
         const resp = await fetch(item_id, {
-            headers: { 'User-Agent': 'OpenMemory-Crawler/1.0 (compatible)' },
+            headers: { 'User-Agent': 'OpenMem-Crawler/1.0 (compatible)' },
             signal: controller.signal
         });
 

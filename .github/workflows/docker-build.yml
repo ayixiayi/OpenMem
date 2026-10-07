@@ -26,10 +26,10 @@ jobs:
       - name: Build Backend Docker Image
         uses: docker/build-push-action@v5
         with:
-          context: ./packages/openmemory-js
-          file: ./packages/openmemory-js/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: false
-          tags: openmemory-backend:test
+          tags: openmem:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
