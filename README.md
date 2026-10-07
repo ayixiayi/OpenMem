@@ -1,5 +1,7 @@
 # OpenMem
 
+**English** | [简体中文](README.zh-CN.md)
+
 Long-term memory for **AI coding agents**, served over MCP. Your agent starts
 every session already knowing what it did, decided and learned in this project
 last time, without you repeating it.
