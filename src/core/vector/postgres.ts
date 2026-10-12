@@ -1,5 +1,5 @@
 import { VectorStore, StoredEmbedding } from "../vector_store";
-import { EmbeddingProvenance, validateVector, validateProvenance } from "../embedding_contract";
+import { EmbeddingProvenance, validateVector, validateProvenance, inSpace } from "../embedding_contract";
 import { bufferToVector, vectorToBuffer, cosineSimilarity } from "../../memory/embed";
 
 export interface DbOps {
@@ -41,12 +41,13 @@ export class PostgresVectorStore implements VectorStore {
         await this.db.run_async(`delete from ${this.table} where id=$1`, [id]);
     }
 
-    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
+    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string, space?: string): Promise<Array<{ id: string; score: number }>> {
         validateVector(queryVec, queryVec.length);
         if (this.usePgVector) {
             const v_str = JSON.stringify(queryVec);
             let filter_sql = "where sector = $2 and vector_dims(v)=vector_dims($1::vector)";
-            const args: any[] = [v_str, sector, topK];
+            // Over-fetch when filtering by embedding space, which happens after ranking.
+            const args: any[] = [v_str, sector, space ? topK * 4 : topK];
 
             if (user_id) {
                 filter_sql += " and user_id = $4";
@@ -59,7 +60,7 @@ export class PostgresVectorStore implements VectorStore {
             }
 
             const sql = `
-                select id, 1 - (v <=> $1::vector) as similarity
+                select id, provenance, 1 - (v <=> $1::vector) as similarity
                 from ${this.table}
                 ${filter_sql}
                 order by v <=> $1::vector
@@ -67,7 +68,10 @@ export class PostgresVectorStore implements VectorStore {
             `;
             const rows = await this.db.all_async(sql, args);
             console.error(`[Vector] pgvector search in sector: ${sector}${user_id ? `, user: ${user_id}` : ''}, returned ${rows.length} results`);
-            return rows.map(r => ({ id: r.id, score: r.similarity }));
+            return rows
+                .filter(r => inSpace(r.provenance ? JSON.parse(r.provenance) : null, space))
+                .slice(0, topK)
+                .map(r => ({ id: r.id, score: r.similarity }));
         } else {
             let filter_sql = "where sector=$1";
             const args: any[] = [sector];
@@ -82,12 +86,13 @@ export class PostgresVectorStore implements VectorStore {
                 filter_sql += ` and id in (select id from ${this.memoriesTable} where project=$${args.length})`;
             }
 
-            const rows = await this.db.all_async(`select id,v,dim from ${this.table} ${filter_sql}`, args);
+            const rows = await this.db.all_async(`select id,v,dim,provenance from ${this.table} ${filter_sql}`, args);
             console.error(`[Vector] sqlite-compat search in sector: ${sector}${user_id ? `, user: ${user_id}` : ''}, found ${rows.length} rows`);
             const sims: Array<{ id: string; score: number }> = [];
             for (const row of rows) {
                 const vec = bufferToVector(row.v);
                 if (vec.length !== queryVec.length) continue;
+                if (!inSpace(row.provenance ? JSON.parse(row.provenance) : null, space)) continue;
                 const sim = cosineSimilarity(queryVec, vec);
                 sims.push({ id: row.id, score: sim });
             }

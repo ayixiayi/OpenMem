@@ -48,3 +48,19 @@ export function validateProvenance(
         );
     }
 }
+
+/**
+ * Vectors are only comparable within one embedding space: same provider,
+ * model, transform and dimension. A chunk average lives in its source's space.
+ */
+export function embeddingSpace(p: EmbeddingProvenance): string {
+    if (p.provider === "composite" && p.model === "chunk-mean" && p.sources?.length === 1)
+        return embeddingSpace(p.sources[0]);
+    const inner = p.sources?.length ? `[${p.sources.map(embeddingSpace).join(",")}]` : "";
+    return `${p.provider}/${p.model}/${p.transform}/${p.dimensions}${inner}`;
+}
+
+/** Unknown (legacy) provenance stays comparable; known provenance must match. */
+export function inSpace(provenance: EmbeddingProvenance | null | undefined, space?: string): boolean {
+    return !space || !provenance || embeddingSpace(provenance) === space;
+}

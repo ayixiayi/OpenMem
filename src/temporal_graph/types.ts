@@ -1,6 +1,10 @@
 export interface TemporalFact {
     id: string;
     user_id?: string;
+    /** `null` for a global fact. */
+    project?: string | null;
+    kind?: 'state' | 'set' | 'event';
+    source_memory_id?: string | null;
     subject: string;
     predicate: string;
     object: string;

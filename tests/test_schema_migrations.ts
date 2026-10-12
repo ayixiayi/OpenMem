@@ -85,7 +85,17 @@ async function main() {
         const memories = await f.all("select * from memories order by id");
         await migrate_sqlite(f.db);
         await migrate_sqlite(f.db);
-        assert.deepEqual(await f.all("select * from temporal_facts"), facts);
+        const legacy_columns =
+            "id,user_id,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata";
+        assert.deepEqual(
+            await f.all(`select ${legacy_columns} from temporal_facts`),
+            facts,
+        );
+        // Migration 4: legacy facts become global, state-kind and unlinked.
+        assert.deepEqual(
+            await f.all("select project,kind,source_memory_id from temporal_facts"),
+            [{ project: null, kind: "state", source_memory_id: null }],
+        );
         assert.deepEqual(
             await f.all("select * from memories order by id"),
             memories,
@@ -106,27 +116,42 @@ async function main() {
             { document_id: "root", section_index: 0, memory_id: "child" },
         ]);
         await f.run(
-            "insert into temporal_facts select 'bob','bob',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+            "insert into temporal_facts(id,user_id,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'bob','bob',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
         );
         await assert.rejects(
             f.run(
-                "insert into temporal_facts select 'duplicate','alice',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+                "insert into temporal_facts(id,user_id,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'duplicate','alice',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
             ),
             /UNIQUE/,
         );
         await f.run(
-            "insert into temporal_facts select 'unowned',null,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+            "insert into temporal_facts(id,user_id,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'unowned',null,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
         );
         await assert.rejects(
             f.run(
-                "insert into temporal_facts select 'duplicate-null',null,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+                "insert into temporal_facts(id,user_id,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'duplicate-null',null,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
             ),
             /UNIQUE/,
+        );
+        // Identity now includes the project: the same fact may hold in two projects.
+        await f.run(
+            "insert into temporal_facts(id,user_id,project,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'alice-other','alice','other',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+        );
+        await assert.rejects(
+            f.run(
+                "insert into temporal_facts(id,user_id,project,subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata) select 'alice-other-dup','alice','other',subject,predicate,object,valid_from,valid_to,confidence,last_updated,metadata from temporal_facts where id='original'",
+            ),
+            /UNIQUE/,
+        );
+        await assert.rejects(
+            f.run("update temporal_facts set kind='bogus' where id='original'"),
+            /CHECK/,
         );
         assert.deepEqual(await f.all("select * from _om_migrations"), [
             { version: 1 },
             { version: 2 },
             { version: 3 },
+            { version: 4 },
         ]);
         assert.deepEqual(
             await f.all(

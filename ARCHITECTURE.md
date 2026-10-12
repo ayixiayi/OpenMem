@@ -24,7 +24,7 @@ HTTP  ──REST───▶ src/server/  ──┘          │                
 | `src/core/db.ts` | Schema bootstrap, query catalogue (`q`), transactions, backend selection |
 | `src/core/schema_migrations.ts` | Numbered, atomic schema migrations (`_om_migrations`) |
 | `src/core/vector/` | Vector stores: SQL (SQLite blobs or pgvector) and Valkey |
-| `src/temporal_graph/` | Time-bounded subject–predicate–object facts |
+| `src/temporal_graph/` | Fact track: scoped, typed, time-bounded subject–predicate–object facts |
 | `src/server/` | Optional HTTP API, auth middleware, background jobs |
 | `src/ops/`, `src/sources/` | Document ingestion and external source connectors (HTTP API only) |
 | `tests/` | Offline suites; `tests/run.cjs` runs them against in-memory SQLite |
@@ -51,7 +51,7 @@ Related tables:
 - `waypoints`: weighted associative edges between memories.
 - `sessions` and `summaries`: session lifecycle and end-of-session summaries.
 - `document_sections`: links an ingested document's root memory to its section memories.
-- `temporal_facts` and `temporal_edges`: time-bounded facts.
+- `temporal_facts`: the fact track (below). `temporal_edges` is used by the HTTP API only.
 
 ### Sectors
 
@@ -70,12 +70,20 @@ matches. The memory is embedded once per matched sector.
 
 1. Compute SimHash, chunk long content and classify sectors.
 2. Inside one transaction:
-   - If a memory with the same user, project and a near-identical SimHash
-     (Hamming ≤ 3) exists, boost its salience and return it instead of
-     inserting.
+   - If a memory with the same user and project has a near-identical SimHash
+     (Hamming ≤ 3) *and* a token-set Jaccard ≥ 0.8, boost its salience and
+     return it instead of inserting. Text with no tokens only matches an
+     identical text.
    - Insert the row, embed each sector and store the vectors.
    - Store `mean_vec` and link the memory to its most similar neighbour in the
      same scope with a waypoint.
+
+An optional `within(memory_id)` callback runs in the same transaction; the
+MCP `both` store uses it to write facts atomically with the observation.
+
+Tokenisation keeps ASCII words as before and splits CJK runs into overlapping
+character bigrams, so Chinese, Japanese and Korean text gets real tokens for
+SimHash, synthetic vectors and overlap scoring.
 
 Embedding runs inside the transaction so that a failed embedding leaves no
 partial memory. With a remote provider, that holds the SQLite write gate for
@@ -84,7 +92,10 @@ the duration of the API call.
 ## Read path (`hsg_query`)
 
 1. **Vector candidates.** Embed the query for each sector and run a
-   similarity search, filtered by user and project *before* top-k.
+   similarity search, filtered by user and project *before* top-k. Only
+   stored vectors in the query's embedding space are compared (same
+   provider, model, transform and dimension; chunk averages count as their
+   source's space). Legacy vectors without provenance are still compared.
 2. **Lexical candidates.** The query is tokenised into plain terms (so FTS
    syntax can't be injected). Matches come from FTS5 bm25 or Postgres
    `ts_rank`, scoped the same way and rank-normalised.
@@ -108,14 +119,73 @@ Scope is a data boundary, not authentication. Unscoped calls search everything.
 | `deep` | Provider embeddings only (`OM_EMBEDDINGS`: openai, gemini, ollama, aws) |
 
 If a provider fails, the next one in `OM_EMBEDDING_FALLBACK` is tried, with
-synthetic as the final fallback. Vectors of a different dimension are
-skipped at query time.
+synthetic as the final fallback. Each vector records its provenance, so a
+memory embedded by a fallback model is excluded from vector search for queries
+embedded by a different model. It is still found through full-text search.
+Unscoped Valkey searches (`FT.SEARCH` and its scan fallback) do not filter by
+space yet; scoped Valkey searches do.
+
+Synthetic vectors are hashed word, character-n-gram and word-sequence
+features. They match repeated vocabulary and identifiers well and have no
+learned notion of paraphrase.
+
+## Fact track (`src/temporal_graph/`)
+
+A fact is `subject · predicate: object`, valid from `valid_from` until
+`valid_to` (open-ended while current). Each fact carries:
+
+| Field | Meaning |
+|---|---|
+| `user_id`, `project` | Scope. `project = NULL` is a global fact (e.g. a user preference). |
+| `kind` | `state`, `set` or `event` (below) |
+| `source_memory_id` | The observation it was extracted from, if any |
+
+Identity is user + project + subject + predicate + object + `valid_from`.
+Subjects are lower-cased and predicates become snake_case on write.
+
+**Update rules** (`insert_fact_in_transaction`), keyed by user + project +
+subject + predicate:
+
+- `state`: one value at a time.
+  - Re-asserting the value that already holds at that time reuses the
+    existing fact.
+  - A new value ends the previous one at `valid_from − 1`.
+  - A backfilled older value ends where the next known value begins, so it
+    never becomes current.
+  - A different value with the *same* `valid_from` is a correction. The
+    mistaken row is kept with an empty interval (`valid_to < valid_from`) and
+    is never returned as valid.
+- `set`: values coexist. A value already held is reused. Values end only
+  through `retract_fact`.
+- `event`: an instant (`valid_to = valid_from`). Never replaces anything and
+  never appears as current state.
+
+**Reads.**
+
+- `query_facts_at_time` returns facts valid at a point in time. A project
+  filter returns that project's facts plus global ones.
+- The MCP `factual` query uses exact `fact_pattern` fields when given.
+  Otherwise it matches the query's words and CJK bigrams against subject,
+  predicate and object, capped by `fact_limit`.
+- `wakeup` lists up to 20 current `state`/`set` facts.
+
+**Linking the tracks.**
+
+- `openmemory_store` with `type: "both"` writes the observation and its
+  facts in one transaction, setting `source_memory_id`.
+- Contextual query results carry `linked_facts` with a status: `current`,
+  `ended`, `corrected` or `event`.
+- An ended state fact also carries the value that replaced it, and the text
+  output marks the hit HISTORICAL. The observation's reasoning stays
+  searchable while its state is clearly superseded.
+- Deleting an observation keeps its facts and clears the link.
 
 ## Lifecycle
 
 - **Wake-up** (`openmemory_wakeup`): an optional `~/.openmem/identity.txt`,
-  then the top memories by salience in the project grouped by observation
-  type (capped at ~3 200 chars), then the last three session summaries.
+  then up to 20 current facts (project + global), then the top memories by
+  salience in the project grouped by observation type (capped at ~3 200
+  chars), then the last three session summaries.
 - **Summaries** (`openmemory_summarize`): the first summary for a session fixes
   that session's project and owner. Later summaries must match both.
 - **Consolidation** (`openmemory_consolidate`): reports low-salience candidates

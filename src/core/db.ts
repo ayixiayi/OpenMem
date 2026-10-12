@@ -118,6 +118,7 @@ let vector_store: VectorStore;
 let memories_table: string;
 let sessions_table: string;
 let summaries_table: string;
+let waypoints_table: string;
 
 async function list_memories(limit: number, offset: number, filters: memory_filters = {}): Promise<any[]> {
     const conditions: string[] = [];
@@ -192,6 +193,7 @@ if (is_pg) {
     const sm = `"${sc}"."openmemory_summaries"`;
     sessions_table = s;
     summaries_table = sm;
+    waypoints_table = w;
     const exec = async (sql: string, p: any[] = []) => {
         return (await pg_transactions.query(convertPlaceholders(sql), p)).rows;
     };
@@ -716,6 +718,7 @@ if (is_pg) {
     memories_table = "memories";
     sessions_table = "sessions";
     summaries_table = "summaries";
+    waypoints_table = "waypoints";
     const schema_ready = migrate_sqlite(db);
     void schema_ready.catch(() => {});
     const context = new AsyncLocalStorage<{ active: boolean }>();
@@ -1063,5 +1066,6 @@ export {
     memories_table,
     sessions_table,
     summaries_table,
+    waypoints_table,
     vector_store,
 };

@@ -233,17 +233,21 @@ async function main() {
         pipeline() {
             const keys: string[] = [];
             return {
-                hgetBuffer(key: string) {
+                hmgetBuffer(key: string, ...fields: string[]) {
+                    assert.deepEqual(fields, ["v", "provenance"]);
                     keys.push(key);
                 },
                 async exec() {
                     return keys.map((key) => [
                         null,
                         key.endsWith("missing")
-                            ? null
-                            : vectorToBuffer(
-                                  key.endsWith("high") ? [1, 0] : [0.6, 0.8],
-                              ),
+                            ? [null, null]
+                            : [
+                                  vectorToBuffer(
+                                      key.endsWith("high") ? [1, 0] : [0.6, 0.8],
+                                  ),
+                                  null,
+                              ],
                     ]);
                 },
             };

@@ -5,14 +5,19 @@
 为 **AI 编程 agent** 提供的长期记忆，通过 MCP 提供服务。agent 每次开启新会话时，
 都已经知道自己上次在这个项目里做了什么、定了什么、学到了什么，不需要你重复交代。
 
-- **一次调用即可唤醒。** `openmemory_wakeup(project)` 返回该项目最重要的记忆（按类型分组）
-  以及最近几次会话的总结，内容紧凑。
+- **一次调用即可唤醒。** `openmemory_wakeup(project)` 返回该项目当前有效的事实、
+  最重要的记忆（按类型分组）以及最近几次会话的总结，内容紧凑。
+- **双轨：为什么，以及现在什么成立。** *观察记录*保存理由、失败的尝试和注意事项；
+  *事实*（`backend · database: PostgreSQL`）保存状态及其生效时间。两者一起保存时会自动关联。
+  事实变化后，旧的观察记录仍能因其中的理由被召回，但会标注 **HISTORICAL** 以及取代它的新值。
 - **按项目和用户隔离。** 每条记忆、会话和总结都带有 `project`。在向量、全文和图检索中，
   过滤都发生在排序*之前*，因此一个仓库的记忆不会挤占或泄漏到另一个仓库。
 - **能找到标识符的混合召回。** 向量相似度、SQLite FTS5 / Postgres 全文匹配与联想路径点
   融合成一个分数。即使向量没能命中，精确的 `ECONNRESET`、文件名或配置项也能被召回。
 - **默认离线可用。** SQLite 加内置的合成向量：不需要 API key，不依赖任何外部服务。
-  通过环境变量即可切换到 OpenAI、Gemini、Ollama 或 AWS 向量，或改用 Postgres + pgvector。
+  合成向量由词和字符片段哈希而成（中日韩文本按相邻两字切分），擅长再次匹配相同的词和标识符，
+  但不理解换一种说法的表达；需要语义理解时，可通过环境变量切换到 OpenAI、Gemini、Ollama 或 AWS 向量。
+  不同模型生成的向量永远不会互相比较。
 - **不只是工具，还有协议。** [`SKILL.md`](SKILL.md) 告诉 agent 何时唤醒、存什么、
   何时搜索以及如何结束一次会话。
 
@@ -20,9 +25,10 @@
 
 | 工具 | 用途 |
 |---|---|
-| `openmemory_wakeup` | 会话开始：返回项目中按类型分组的重要记忆 + 最近的会话总结 |
-| `openmemory_store` | 保存一条观察，可带 `project`、`session_id`、`observation_type`、标签和元数据（也可存时序事实） |
-| `openmemory_query` | 限定作用域的混合搜索（向量 + 全文 + 路径点），可选时序事实查询 |
+| `openmemory_wakeup` | 会话开始：当前事实 + 按类型分组的重要记忆 + 最近的会话总结 |
+| `openmemory_store` | 保存观察记录和/或事实；`type: "both"` 在同一事务中保存并建立关联 |
+| `openmemory_query` | 限定作用域的混合搜索观察记录；`factual` 查询当前或某个时间点成立的事实；`unified` 两者都查 |
+| `openmemory_retract_fact` | 结束一条不再成立、且没有替代值的事实 |
 | `openmemory_summarize` | 保存会话总结：需求、完成内容、收获、后续步骤、修改的文件 |
 | `openmemory_timeline` | 按时间顺序返回某条记忆前后的记忆 |
 | `openmemory_consolidate` | 判断项目是否需要整理，并返回低价值的候选记忆 |
@@ -33,6 +39,14 @@
 | `openmemory_status` | 按项目/类型/扇区统计数量、向量配置以及使用协议 |
 
 观察类型：`observation`、`bugfix`、`decision`、`discovery`、`feature`、`gotcha`、`refactor`。
+
+事实类型决定新值如何生效：
+
+- `state`（同一时间只有一个值）会结束旧值。
+- `set`（可以并存的值，如支持的平台）与已有值并存。
+- `event`（部署、故障）记录为某一时刻。
+
+事实属于某个项目，或属于全局范围（例如用户偏好）。较早的值可以补录进历史。
 
 ## 安装
 
@@ -76,21 +90,30 @@ claude mcp add openmem -- node /path/to/OpenMem/dist/ai/mcp.js
 ## 一次会话的样子
 
 ```
-会话 1 — 项目 "my-app"
-  → openmemory_wakeup("my-app")                       ← "new project"
-  → openmemory_store("Chose JWT over server sessions: the API is stateless
-       behind a load balancer", project: "my-app", observation_type: "decision")
-  → openmemory_summarize(project: "my-app", completed: "JWT auth", learned: …)
+会话 1 — 项目 "api"
+  → openmemory_wakeup("api")                                  ← "new project"
+  → openmemory_store(type: "both", project: "api", observation_type: "decision",
+       content: "Chose SQLite: single writer, no server to run.",
+       facts: [{ subject: "backend", predicate: "database", object: "SQLite" }])
+  → openmemory_summarize(project: "api", completed: "storage layer", …)
 
-会话 2 — 新对话，同一个项目
-  → openmemory_wakeup("my-app")
-  ← ## Essential Context (1 memories)
+会话 7 — 现在有多个 worker 并发写入
+  → openmemory_store(type: "both", project: "api", observation_type: "decision",
+       content: "Moved to PostgreSQL: concurrent workers hit SQLITE_BUSY under load.",
+       facts: [{ subject: "backend", predicate: "database", object: "PostgreSQL" }])
+
+会话 8 — 新对话
+  → openmemory_wakeup("api")
+  ← ## Current Facts (1)
+    - backend · database: PostgreSQL
+    ## Essential Context (2 memories)
     [DECISION]
-    - Chose JWT over server sessions: the API is stateless behind a load balancer
-    ## Recent Sessions (1)
-    Session: Add authentication
-      Done: JWT auth
-      Next: refresh-token rotation
+    - Moved to PostgreSQL: concurrent workers hit SQLITE_BUSY under load.
+    - Chose SQLite: single writer, no server to run.
+  → openmemory_query("why SQLite?", project: "api")
+  ← 1. [semantic] score=0.93 salience=0.40 id=…
+    Chose SQLite: single writer, no server to run.
+       ↳ HISTORICAL: backend · database: SQLite — now PostgreSQL (since 2026-…)
 ```
 
 ## 检索流程

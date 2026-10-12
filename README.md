@@ -7,8 +7,13 @@ every session already knowing what it did, decided and learned in this project
 last time, without you repeating it.
 
 - **One call to wake up.** `openmemory_wakeup(project)` returns the project's
-  most important memories, grouped by type, plus the last few session summaries,
-  in a compact block.
+  current facts, its most important memories grouped by type, and the last few
+  session summaries, in a compact block.
+- **Two tracks: why, and what's true now.** *Observations* keep the reasoning,
+  failed attempts and gotchas. *Facts* (`backend · database: PostgreSQL`) keep
+  the state, each with the time it became true. Storing both at once links
+  them. When a fact changes, the old observation is still recalled for its
+  reasoning but labelled **HISTORICAL** with the value that replaced it.
 - **Scoped by project and user.** Every memory, session and summary carries a
   `project`. Filters apply *before* ranking in vector, full-text and graph
   retrieval, so one repository's memories never crowd out or leak into another's.
@@ -17,8 +22,11 @@ last time, without you repeating it.
   An exact `ECONNRESET`, file name or config key is recalled even when the
   embedding misses it.
 - **Offline by default.** SQLite plus built-in synthetic embeddings: no API key,
-  no external service. Switch to OpenAI, Gemini, Ollama or AWS embeddings, or to
-  Postgres + pgvector, with environment variables.
+  no external service. Synthetic embeddings are hashed word and character
+  features (CJK as character bigrams). They are strong at matching the same
+  words and identifiers again, but they don't understand paraphrases. For
+  that, switch to OpenAI, Gemini, Ollama or AWS embeddings with environment
+  variables. Vectors from different models are never compared with each other.
 - **A protocol, not just tools.** [`SKILL.md`](SKILL.md)
   tells the agent when to wake up, what to store, when to search and how to
   close a session.
@@ -27,9 +35,10 @@ last time, without you repeating it.
 
 | Tool | Purpose |
 |---|---|
-| `openmemory_wakeup` | Session start: top memories by type + recent session summaries for a project |
-| `openmemory_store` | Save an observation with `project`, `session_id`, `observation_type`, tags and metadata (optionally temporal facts) |
-| `openmemory_query` | Scoped hybrid search (vector + full-text + waypoints); optional temporal fact lookup |
+| `openmemory_wakeup` | Session start: current facts + top memories by type + recent session summaries for a project |
+| `openmemory_store` | Save an observation and/or facts. `type: "both"` stores them atomically and links them |
+| `openmemory_query` | Scoped hybrid search over observations; `factual` for what is true now or at a date; `unified` for both |
+| `openmemory_retract_fact` | End a fact that is no longer true without a replacement |
 | `openmemory_summarize` | Save a session summary: request, completed, learned, next steps, files |
 | `openmemory_timeline` | Memories before and after an anchor memory, in order |
 | `openmemory_consolidate` | Report whether a project needs consolidation and return low-value candidates |
@@ -41,6 +50,15 @@ last time, without you repeating it.
 
 Observation types: `observation`, `bugfix`, `decision`, `discovery`, `feature`,
 `gotcha`, `refactor`.
+
+Fact kinds decide how a new value is applied:
+
+- `state` (one value at a time) ends the previous value.
+- `set` (values that coexist, such as supported platforms) adds alongside the others.
+- `event` (deploys, outages) is recorded as an instant.
+
+Facts belong to a project, or to the global scope for things like user
+preferences. Older values can be backfilled into history.
 
 ## Setup
 
@@ -86,21 +104,30 @@ Optional: put a few lines about yourself or your conventions in
 ## How a session looks
 
 ```
-Session 1 — project "my-app"
-  → openmemory_wakeup("my-app")                       ← "new project"
-  → openmemory_store("Chose JWT over server sessions: the API is stateless
-       behind a load balancer", project: "my-app", observation_type: "decision")
-  → openmemory_summarize(project: "my-app", completed: "JWT auth", learned: …)
+Session 1 — project "api"
+  → openmemory_wakeup("api")                                  ← "new project"
+  → openmemory_store(type: "both", project: "api", observation_type: "decision",
+       content: "Chose SQLite: single writer, no server to run.",
+       facts: [{ subject: "backend", predicate: "database", object: "SQLite" }])
+  → openmemory_summarize(project: "api", completed: "storage layer", …)
 
-Session 2 — new conversation, same project
-  → openmemory_wakeup("my-app")
-  ← ## Essential Context (1 memories)
+Session 7 — workers now write concurrently
+  → openmemory_store(type: "both", project: "api", observation_type: "decision",
+       content: "Moved to PostgreSQL: concurrent workers hit SQLITE_BUSY under load.",
+       facts: [{ subject: "backend", predicate: "database", object: "PostgreSQL" }])
+
+Session 8 — new conversation
+  → openmemory_wakeup("api")
+  ← ## Current Facts (1)
+    - backend · database: PostgreSQL
+    ## Essential Context (2 memories)
     [DECISION]
-    - Chose JWT over server sessions: the API is stateless behind a load balancer
-    ## Recent Sessions (1)
-    Session: Add authentication
-      Done: JWT auth
-      Next: refresh-token rotation
+    - Moved to PostgreSQL: concurrent workers hit SQLITE_BUSY under load.
+    - Chose SQLite: single writer, no server to run.
+  → openmemory_query("why SQLite?", project: "api")
+  ← 1. [semantic] score=0.93 salience=0.40 id=…
+    Chose SQLite: single writer, no server to run.
+       ↳ HISTORICAL: backend · database: SQLite — now PostgreSQL (since 2026-…)
 ```
 
 ## Retrieval pipeline

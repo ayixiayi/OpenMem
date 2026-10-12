@@ -87,7 +87,32 @@ async function main() {
         [target.id],
     );
 
-    console.log("[HYBRID] Scoped lexical recall, safe query parsing, bounded scores and index sync passed");
+    // Vectors from another embedding model are never compared, even at the same dimension.
+    {
+        const { embeddingSpace } = await import("../src/core/embedding_contract");
+        const { embedForSectorWithProvenance } = await import("../src/memory/embed");
+        const query = await embedForSectorWithProvenance("space isolation probe", "semantic");
+        const space = embeddingSpace(query.provenance);
+        const foreign = { ...query.provenance, provider: "openai", model: "other-model" };
+        const { randomUUID } = await import("node:crypto");
+        const ids_of = { foreign: randomUUID(), legacy: randomUUID(), same: randomUUID() };
+        await vector_store.storeVector(ids_of.foreign, "semantic", query.vector, query.vector.length, "space-user", foreign);
+        await vector_store.storeVector(ids_of.legacy, "semantic", query.vector, query.vector.length, "space-user", null);
+        await vector_store.storeVector(ids_of.same, "semantic", query.vector, query.vector.length, "space-user", query.provenance);
+        const ids = (await vector_store.searchSimilar("semantic", query.vector, 10, "space-user", undefined, space))
+            .map((r) => r.id)
+            .sort();
+        assert.deepEqual(ids, [ids_of.legacy, ids_of.same].sort());
+        assert.equal(
+            (await vector_store.searchSimilar("semantic", query.vector, 10, "space-user")).length,
+            3,
+            "without a space every vector of matching dimension is compared",
+        );
+        const chunked = { schema_version: 1 as const, provider: "composite", model: "chunk-mean", sector: "semantic", dimensions: query.vector.length, transform: "arithmetic-mean-v1", sources: [query.provenance] };
+        assert.equal(embeddingSpace(chunked), space, "a chunk average shares its source's space");
+    }
+
+    console.log("[HYBRID] Scoped lexical recall, safe query parsing, bounded scores, index sync and embedding-space isolation passed");
     process.exit(0);
 }
 

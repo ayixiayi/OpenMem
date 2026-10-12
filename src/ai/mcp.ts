@@ -13,6 +13,7 @@ import {
     reinforce_memory,
     delete_memory,
     sector_configs,
+    fts_stopwords,
 } from "../memory/hsg";
 import {
     q,
@@ -27,8 +28,18 @@ import { getEmbeddingInfo } from "../memory/embed";
 import { j, p } from "../utils";
 import type { sector_type, mem_row, rpc_err_code } from "../core/types";
 import { update_user_summary } from "../memory/user_summary";
-import { insert_fact } from "../temporal_graph/store";
-import { query_facts_at_time } from "../temporal_graph/query";
+import {
+    insert_fact_in_transaction,
+    retract_fact,
+    type FactKind,
+} from "../temporal_graph/store";
+import {
+    query_facts_at_time,
+    get_facts_by_source,
+    get_successor,
+} from "../temporal_graph/query";
+import type { TemporalFact } from "../temporal_graph/types";
+import { tokenize } from "../utils/text";
 import { ToolRegistry } from "./mcp_tools";
 
 const SERVER_VERSION = "2.1.0";
@@ -53,11 +64,73 @@ const build_mem_snap = (row: mem_row) => ({
     content_preview: trunc(row.content, 240),
 });
 
+const day = (d: Date) => d.toISOString().slice(0, 10);
+const fact_line = (f: TemporalFact) => `${f.subject} · ${f.predicate}: ${f.object}`;
+const fact_json = (f: TemporalFact) => ({
+    source: "temporal",
+    id: f.id,
+    subject: f.subject,
+    predicate: f.predicate,
+    object: f.object,
+    kind: f.kind ?? "state",
+    scope: f.project ?? "global",
+    valid_from: f.valid_from.toISOString(),
+    valid_to: f.valid_to ? f.valid_to.toISOString() : null,
+    confidence: Number(f.confidence.toFixed(4)),
+    source_memory_id: f.source_memory_id ?? null,
+    content: `${f.subject} ${f.predicate} ${f.object}`,
+});
+
+type linked_fact = {
+    id: string;
+    fact: string;
+    status: "current" | "ended" | "corrected" | "event";
+    replaced_by?: { object: string; since: string };
+};
+
+/** Facts extracted from these memories, with what replaced them if they ended. */
+async function linked_facts(memory_ids: string[], now: number) {
+    const by_memory = new Map<string, linked_fact[]>();
+    for (const f of await get_facts_by_source(memory_ids)) {
+        const ended = f.valid_to !== null && f.valid_to.getTime() < now;
+        const status: linked_fact["status"] =
+            f.kind === "event"
+                ? "event"
+                : f.valid_to && f.valid_to < f.valid_from
+                  ? "corrected"
+                  : ended
+                    ? "ended"
+                    : "current";
+        const entry: linked_fact = { id: f.id, fact: fact_line(f), status };
+        if (status === "ended" && (f.kind ?? "state") === "state") {
+            const next = await get_successor(f);
+            if (next) entry.replaced_by = { object: next.object, since: day(next.valid_from) };
+        }
+        const list = by_memory.get(f.source_memory_id!) ?? [];
+        list.push(entry);
+        by_memory.set(f.source_memory_id!, list);
+    }
+    return by_memory;
+}
+
+const fmt_linked = (facts?: linked_fact[]) =>
+    (facts ?? [])
+        .map((f) =>
+            f.status === "ended" || f.status === "corrected"
+                ? `\n   ↳ HISTORICAL: ${f.fact} — ${f.status === "corrected" ? "corrected" : f.replaced_by ? `now ${f.replaced_by.object} (since ${f.replaced_by.since})` : "no longer true"}`
+                : `\n   ↳ ${f.status === "event" ? "event" : "current fact"}: ${f.fact}`,
+        )
+        .join("");
+
+/** Words and CJK bigrams used to match a natural-language question to facts. */
+const fact_terms = (text: string) =>
+    [...new Set(tokenize(text))].filter((t) => t.length >= 2 && !fts_stopwords.has(t));
+
 const fmt_matches = (matches: Awaited<ReturnType<typeof hsg_query>>) =>
     matches
         .map((m: any, idx: any) => {
             const prev = trunc(m.content.replace(/\s+/g, " ").trim(), 200);
-            return `${idx + 1}. [${m.primary_sector}] score=${m.score.toFixed(3)} salience=${m.salience.toFixed(3)} id=${m.id}\n${prev}`;
+            return `${idx + 1}. [${m.primary_sector}] score=${m.score.toFixed(3)} salience=${m.salience.toFixed(3)} id=${m.id}\n${prev}${fmt_linked(m.linked_facts)}`;
         })
         .join("\n\n");
 
@@ -106,66 +179,58 @@ export const create_mcp_srv = () => {
 
     registry.tool(
         "openmemory_query",
-        "Query OpenMemory for contextual memories (HSG) and/or temporal facts",
+        "Search memory. 'contextual' searches observations (why/how/what happened); 'factual' returns facts valid at a point in time (what is true now, or was then); 'unified' does both. Contextual hits whose extracted facts have since changed are marked HISTORICAL.",
         {
             query: z
                 .string()
                 .min(1, "query text is required")
-                .describe("Free-form search text"),
+                .describe("Free-form search text; also matched against fact subject/predicate/object when no fact_pattern is given"),
             type: z
                 .enum(["contextual", "factual", "unified"])
                 .optional()
                 .default("contextual")
-                .describe(
-                    "Query type: 'contextual' for HSG semantic search (default), 'factual' for temporal fact queries, 'unified' for both",
-                ),
+                .describe("'contextual' (default), 'factual' or 'unified'"),
             fact_pattern: z
                 .object({
-                    subject: z
-                        .string()
-                        .optional()
-                        .describe("Subject pattern (entity) - use undefined for wildcard"),
-                    predicate: z
-                        .string()
-                        .optional()
-                        .describe("Predicate pattern (relationship) - use undefined for wildcard"),
-                    object: z
-                        .string()
-                        .optional()
-                        .describe("Object pattern (value) - use undefined for wildcard"),
+                    subject: z.string().optional().describe("Exact entity, e.g. 'backend'"),
+                    predicate: z.string().optional().describe("Exact attribute, e.g. 'database'"),
+                    object: z.string().optional().describe("Exact value"),
                 })
                 .optional()
-                .describe(
-                    "Fact pattern for temporal queries. Used when type is 'factual' or 'unified'",
-                ),
+                .describe("Exact fact filter; omit to match facts by the query text"),
             at: z
                 .string()
                 .optional()
-                .describe(
-                    "ISO date string for point-in-time queries (default: now). Queries facts valid at this time",
-                ),
+                .describe("ISO date for point-in-time fact queries (default: now)"),
             k: z
                 .number()
                 .int()
                 .min(1)
                 .max(32)
                 .default(8)
-                .describe("Maximum results to return (for HSG queries)"),
+                .describe("Maximum contextual results"),
+            fact_limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(100)
+                .default(20)
+                .describe("Maximum factual results"),
             sector: sec_enum
                 .optional()
-                .describe("Restrict search to a specific sector (for HSG queries)"),
+                .describe("Restrict contextual search to a sector"),
             min_salience: z
                 .number()
                 .min(0)
                 .max(1)
                 .optional()
-                .describe("Minimum salience threshold (for HSG queries)"),
+                .describe("Minimum salience (contextual)"),
             min_score: z
                 .number()
                 .min(0)
                 .max(1)
                 .optional()
-                .describe("Minimum score threshold to filter low-relevance results"),
+                .describe("Minimum score in [0,1) (contextual)"),
             user_id: z
                 .string()
                 .trim()
@@ -177,7 +242,7 @@ export const create_mcp_srv = () => {
                 .trim()
                 .min(1)
                 .optional()
-                .describe("Restrict search to a specific project scope"),
+                .describe("Project scope. Fact queries also include global facts."),
         },
         async ({
             query,
@@ -185,6 +250,7 @@ export const create_mcp_srv = () => {
             fact_pattern,
             at,
             k,
+            fact_limit,
             sector,
             min_salience,
             min_score,
@@ -195,6 +261,7 @@ export const create_mcp_srv = () => {
             const proj = project?.trim() || undefined;
             const results: any = { type, query };
             const at_date = at ? new Date(at) : new Date();
+            if (Number.isNaN(at_date.getTime())) throw new Error(`Invalid 'at' date: ${at}`);
 
             if (type === "contextual" || type === "unified") {
                 const flt =
@@ -214,7 +281,10 @@ export const create_mcp_srv = () => {
                 if (min_score !== undefined) {
                     matches = matches.filter((m: any) => m.score >= min_score);
                 }
-
+                const links = await linked_facts(
+                    matches.map((m) => m.id),
+                    Date.now(),
+                );
                 results.contextual = matches.map((m: any) => ({
                     source: "hsg",
                     id: m.id,
@@ -225,33 +295,49 @@ export const create_mcp_srv = () => {
                     last_seen_at: m.last_seen_at,
                     path: m.path,
                     content: m.content,
+                    ...(links.has(m.id) ? { linked_facts: links.get(m.id) } : {}),
                 }));
             }
 
-
             if (type === "factual" || type === "unified") {
-                const facts = await query_facts_at_time(
-                    fact_pattern?.subject,
-                    fact_pattern?.predicate,
-                    fact_pattern?.object,
+                const pattern =
+                    fact_pattern?.subject || fact_pattern?.predicate || fact_pattern?.object
+                        ? fact_pattern
+                        : undefined;
+                const limit = fact_limit ?? 20;
+                let facts = await query_facts_at_time(
+                    pattern?.subject,
+                    pattern?.predicate,
+                    pattern?.object,
                     at_date,
                     0.0,
                     u,
+                    { project: proj, limit: pattern ? limit : 1000 },
                 );
-
-                results.factual = facts.map((f: any) => ({
-                    source: "temporal",
-                    id: f.id,
-                    subject: f.subject,
-                    predicate: f.predicate,
-                    object: f.object,
-                    valid_from: f.valid_from,
-                    valid_to: f.valid_to,
-                    confidence: Number(f.confidence.toFixed(4)),
-                    content: `${f.subject} ${f.predicate} ${f.object}`,
-                }));
+                if (!pattern) {
+                    const terms = fact_terms(query);
+                    if (terms.length) {
+                        facts = facts
+                            .map((f) => {
+                                const hay = `${f.subject} ${f.predicate} ${f.object}`.toLowerCase();
+                                return { f, hits: terms.filter((t) => hay.includes(t)).length };
+                            })
+                            .filter((x) => x.hits > 0)
+                            .sort((a, b) => b.hits - a.hits)
+                            .map((x) => x.f);
+                    }
+                    facts = facts.slice(0, limit);
+                }
+                results.factual = facts.map(fact_json);
             }
 
+            const fmt_facts = (facts: any[]) =>
+                facts
+                    .map(
+                        (f: any, idx: number) =>
+                            `${idx + 1}. [${f.kind}${f.scope === "global" ? ", global" : ""}] ${f.subject} · ${f.predicate}: ${f.object} (since ${f.valid_from.slice(0, 10)}${f.valid_to ? `, until ${f.valid_to.slice(0, 10)}` : ""}) id=${f.id}`,
+                    )
+                    .join("\n");
 
             let summ = "";
             if (type === "contextual") {
@@ -259,40 +345,16 @@ export const create_mcp_srv = () => {
                     ? fmt_matches(results.contextual)
                     : "No contextual memories matched the query.";
             } else if (type === "factual") {
-                if (results.factual.length === 0) {
-                    summ = "No temporal facts matched the query.";
-                } else {
-                    summ = results.factual
-                        .map(
-                            (f: any, idx: number) =>
-                                `${idx + 1}. [fact] confidence=${f.confidence} id=${f.id}\n${f.content}`,
-                        )
-                        .join("\n\n");
-                }
+                summ = results.factual.length
+                    ? fmt_facts(results.factual)
+                    : "No facts matched the query.";
             } else {
-
-                const ctx_count = results.contextual?.length || 0;
-                const fact_count = results.factual?.length || 0;
-                summ = `Found ${ctx_count} contextual memories and ${fact_count} temporal facts.\n\n`;
-
-                if (ctx_count > 0) {
-                    summ += "=== Contextual Memories ===\n";
-                    summ += fmt_matches(results.contextual) + "\n\n";
-                }
-
-                if (fact_count > 0) {
-                    summ += "=== Temporal Facts ===\n";
-                    summ += results.factual
-                        .map(
-                            (f: any, idx: number) =>
-                                `${idx + 1}. [fact] confidence=${f.confidence}\n${f.content}`,
-                        )
-                        .join("\n\n");
-                }
-
-                if (ctx_count === 0 && fact_count === 0) {
-                    summ = "No results found in either system.";
-                }
+                const ctx_count = results.contextual.length;
+                const fact_count = results.factual.length;
+                summ = `Found ${fact_count} facts and ${ctx_count} contextual memories.`;
+                if (fact_count > 0) summ += `\n\n=== Facts (valid ${at ? `at ${at}` : "now"}) ===\n${fmt_facts(results.factual)}`;
+                if (ctx_count > 0) summ += `\n\n=== Contextual Memories ===\n${fmt_matches(results.contextual)}`;
+                if (ctx_count === 0 && fact_count === 0) summ = "No results found in either track.";
             }
 
             return {
@@ -309,47 +371,51 @@ export const create_mcp_srv = () => {
 
     registry.tool(
         "openmemory_store",
-        "Persist new content into OpenMemory (HSG contextual memory and/or temporal facts)",
+        "Persist an observation (contextual) and/or structured facts. Use type 'both' when an observation establishes or changes a fact: it is stored atomically and the facts link back to the observation.",
         {
-            content: z.string().min(1).describe("Raw memory text to store"),
+            content: z.string().min(1).describe("The observation, written for a future agent with zero context"),
             type: z
                 .enum(["contextual", "factual", "both"])
                 .optional()
                 .default("contextual")
-                .describe(
-                    "Storage type: 'contextual' for HSG only (default), 'factual' for temporal facts only, 'both' for both systems",
-                ),
+                .describe("'contextual' (default), 'factual', or 'both' (observation + facts in one transaction)"),
             facts: z
                 .array(
                     z.object({
-                        subject: z.string().min(1).describe("Fact subject (entity)"),
+                        subject: z.string().min(1).describe("Entity, e.g. 'backend', 'user'"),
                         predicate: z
                             .string()
                             .min(1)
-                            .describe("Fact predicate (relationship)"),
-                        object: z.string().min(1).describe("Fact object (value)"),
+                            .describe("Attribute in snake_case, e.g. 'database', 'supported_platform'"),
+                        object: z.string().min(1).describe("Value, e.g. 'PostgreSQL'"),
+                        kind: z
+                            .enum(["state", "set", "event"])
+                            .optional()
+                            .default("state")
+                            .describe("'state': one value at a time, a new one ends the old (default). 'set': values coexist, retract individually. 'event': something that happened at valid_from"),
+                        scope: z
+                            .enum(["project", "global"])
+                            .optional()
+                            .default("project")
+                            .describe("'project' (default) or 'global' for facts that hold in every project, such as user preferences"),
                         confidence: z
                             .number()
                             .min(0)
                             .max(1)
                             .optional()
-                            .describe("Confidence score (0-1, default 1.0)"),
+                            .describe("Confidence 0-1 (default 1.0)"),
                         valid_from: z
                             .string()
                             .optional()
-                            .describe(
-                                "ISO date string for fact validity start (default: now)",
-                            ),
+                            .describe("ISO date the fact became true (default: now). Earlier dates are backfilled into history."),
                     }),
                 )
                 .optional()
-                .describe(
-                    "Array of facts to store in temporal graph. Required when type is 'factual' or 'both'",
-                ),
+                .describe("Facts to store. Required when type is 'factual' or 'both'"),
             tags: z
                 .array(z.string())
                 .optional()
-                .describe("Optional tag list (for HSG storage)"),
+                .describe("Optional tag list (contextual)"),
             metadata: z
                 .record(z.any())
                 .optional()
@@ -359,17 +425,13 @@ export const create_mcp_srv = () => {
                 .trim()
                 .min(1)
                 .optional()
-                .describe(
-                    "Associate the memory with a specific user identifier",
-                ),
+                .describe("Associate the memory with a specific user identifier"),
             project: z
                 .string()
                 .trim()
                 .min(1)
                 .optional()
-                .describe(
-                    "Project scope for this memory (e.g., directory basename)",
-                ),
+                .describe("Project scope (working directory basename); applies to both tracks"),
             session_id: z
                 .string()
                 .trim()
@@ -402,8 +464,8 @@ export const create_mcp_srv = () => {
             observation_type,
         }) => {
             const u = uid(user_id);
+            const proj = project ?? "default";
             const results: any = { type };
-
 
             if (
                 (type === "factual" || type === "both") &&
@@ -414,6 +476,34 @@ export const create_mcp_srv = () => {
                 );
             }
 
+            const temporal: any[] = [];
+            const write_facts = async (source_memory_id: string | null) => {
+                for (const fact of facts ?? []) {
+                    const valid_from = fact.valid_from ? new Date(fact.valid_from) : new Date();
+                    const kind = (fact.kind ?? "state") as FactKind;
+                    const scope = fact.scope === "global" ? null : proj;
+                    const id = await insert_fact_in_transaction(
+                        fact.subject,
+                        fact.predicate,
+                        fact.object,
+                        valid_from,
+                        fact.confidence ?? 1.0,
+                        metadata,
+                        u,
+                        { project: scope, kind, source_memory_id },
+                    );
+                    temporal.push({
+                        id,
+                        subject: fact.subject,
+                        predicate: fact.predicate,
+                        object: fact.object,
+                        kind,
+                        scope: scope ?? "global",
+                        valid_from: valid_from.toISOString(),
+                        source_memory_id,
+                    });
+                }
+            };
 
             if (type === "contextual" || type === "both") {
                 const res = await add_hsg_memory(
@@ -424,59 +514,33 @@ export const create_mcp_srv = () => {
                     project,
                     session_id,
                     observation_type,
+                    type === "both" ? write_facts : undefined,
                 );
                 results.hsg = {
                     id: res.id,
                     primary_sector: res.primary_sector,
                     sectors: res.sectors,
+                    ...(res.deduplicated ? { deduplicated: true } : {}),
                 };
-
                 if (u) {
                     update_user_summary(u).catch((err) =>
                         console.error("[MCP] user summary update failed:", err),
                     );
                 }
+            } else {
+                await transaction.run(() => write_facts(null));
             }
+            if (temporal.length) results.temporal = temporal;
 
-
-            if ((type === "factual" || type === "both") && facts) {
-                const temporal_results = [];
-                for (const fact of facts) {
-                    const valid_from = fact.valid_from
-                        ? new Date(fact.valid_from)
-                        : new Date();
-                    const confidence = fact.confidence ?? 1.0;
-
-                    const fact_id = await insert_fact(
-                        fact.subject,
-                        fact.predicate,
-                        fact.object,
-                        valid_from,
-                        confidence,
-                        metadata,
-                        u,
-                    );
-
-                    temporal_results.push({
-                        id: fact_id,
-                        subject: fact.subject,
-                        predicate: fact.predicate,
-                        object: fact.object,
-                        valid_from: valid_from.toISOString(),
-                        confidence,
-                    });
-                }
-                results.temporal = temporal_results;
-            }
-
-
+            const who = u ? ` [user=${u}]` : "";
+            const fact_txt = `${temporal.length} fact(s): ${temporal.map((f) => `${f.subject} · ${f.predicate}: ${f.object} (${f.kind})`).join("; ")}`;
             let txt = "";
             if (type === "contextual") {
-                txt = `Stored memory ${results.hsg.id} (primary=${results.hsg.primary_sector}) across sectors: ${results.hsg.sectors.join(", ")}${u ? ` [user=${u}]` : ""}`;
+                txt = `Stored memory ${results.hsg.id} (primary=${results.hsg.primary_sector}) across sectors: ${results.hsg.sectors.join(", ")}${results.hsg.deduplicated ? " (merged with a near-duplicate)" : ""}${who}`;
             } else if (type === "factual") {
-                txt = `Stored ${results.temporal.length} temporal fact(s)${u ? ` [user=${u}]` : ""}`;
+                txt = `Stored ${fact_txt}${who}`;
             } else {
-                txt = `Stored in both systems: HSG memory ${results.hsg.id} + ${results.temporal.length} temporal fact(s)${u ? ` [user=${u}]` : ""}`;
+                txt = `Stored memory ${results.hsg.id} and ${fact_txt}, linked to it${who}`;
             }
 
             return {
@@ -491,6 +555,35 @@ export const create_mcp_srv = () => {
                         ),
                     },
                 ],
+            };
+        },
+    );
+
+    registry.tool(
+        "openmemory_retract_fact",
+        "End a fact that is no longer true without replacing it, e.g. a platform no longer supported (set kind) or a removed setting. To change a state fact's value, store the new value instead.",
+        {
+            id: z.string().min(1).optional().describe("Fact id; or give subject + predicate (+ object)"),
+            subject: z.string().min(1).optional(),
+            predicate: z.string().min(1).optional(),
+            object: z.string().min(1).optional().describe("Retract only this value; omit to retract every current value"),
+            scope: z.enum(["project", "global"]).optional().default("project"),
+            project: z.string().trim().min(1).optional().describe("Project the fact belongs to (default 'default')"),
+            user_id: z.string().trim().min(1).optional(),
+            at: z.string().optional().describe("ISO date it stopped being true (default: now)"),
+        },
+        async (args) => {
+            const at = args.at ? new Date(args.at) : new Date();
+            if (Number.isNaN(at.getTime())) throw new Error(`Invalid 'at' date: ${args.at}`);
+            const n = await retract_fact(
+                { id: args.id, subject: args.subject, predicate: args.predicate, object: args.object },
+                at,
+                uid(args.user_id),
+                args.scope === "global" ? null : (args.project ?? "default"),
+            );
+            return {
+                content: [{ type: "text", text: n ? `Retracted ${n} fact(s) as of ${at.toISOString()}` : "No current fact matched." }],
+                ...(n ? {} : { isError: true }),
             };
         },
     );
@@ -883,18 +976,13 @@ export const create_mcp_srv = () => {
             );
 
             const protocol = `MEMORY PROTOCOL:
-1. SESSION START: Call openmemory_wakeup(project) to load compressed context (~200 tokens). If no memories exist, proceed normally.
-2. DURING WORK: After completing meaningful tasks, call openmemory_store with:
-   - content: compressed observation (write for a future agent with zero context)
-   - project: working directory basename
-   - observation_type: one of observation|bugfix|decision|discovery|feature|gotcha|refactor
-   - tags: consistent category tags
-   - metadata: { facts: [...], files_involved: [...], concepts: [...] }
-3. BEFORE FACTS CHANGE: If a previously stored fact is now outdated, store the new fact with updated context.
-4. SESSION END: Call openmemory_summarize with session_id, project, request, completed, learned, next_steps, files_modified.
-5. SEARCH: Use openmemory_query(query, project) when user asks about past work. Use natural language.
-6. NEVER GUESS: If the user asks about past work, search first. Don't rely on your own memory.
-7. CONSOLIDATION: When openmemory_wakeup shows many memories, call openmemory_consolidate(project) to check if consolidation is needed. If yes, synthesize low-value memories into fewer high-quality ones, then delete originals.`;
+1. SESSION START: Call openmemory_wakeup(project) once. It returns current facts, the most important observations and recent session summaries.
+2. DURING WORK: After meaningful steps, call openmemory_store with content (self-contained, written for a future agent), project, session_id and observation_type (observation|bugfix|decision|discovery|feature|gotcha|refactor). Store WHY, not just what.
+3. FACTS: When the work establishes or changes something that is simply true now (the project's database, a confirmed setting, a user preference), use type 'both' and add facts. kind 'state' = one value at a time (a new value ends the old); 'set' = values that coexist (supported platforms); 'event' = something that happened. scope 'global' for facts that hold in every project. Use openmemory_retract_fact when something stops being true without a replacement.
+4. SEARCH: openmemory_query(query, project) before answering questions about past work. type 'factual' for what is true now (or 'at' a date); 'unified' for both. Results marked HISTORICAL describe a state that has since changed.
+5. SESSION END: Call openmemory_summarize with session_id, project, request, completed, learned, next_steps, files_modified.
+6. NEVER GUESS about past work; search first.
+7. CONSOLIDATION: When wakeup shows many memories, call openmemory_consolidate(project) and merge low-value ones.`;
 
             const pay = {
                 total_memories: Number(total),
@@ -975,6 +1063,15 @@ export const create_mcp_srv = () => {
                 essential_story += "\n";
             }
 
+            // L0.5: Current facts (state + set) for the project and global scope.
+            const current_facts = await query_facts_at_time(
+                undefined, undefined, undefined, new Date(), 0.1, user_id,
+                { project: args.project, kinds: ["state", "set"], limit: 20 },
+            );
+            const facts_text = current_facts
+                .map((f) => `- ${fact_line(f)}${f.project ? "" : " (global)"}`)
+                .join("\n");
+
             // L1.5: Recent summaries
             const recent_summaries = await q.get_summaries_by_project.all(
                 args.project, 3, user_id,
@@ -991,6 +1088,7 @@ export const create_mcp_srv = () => {
 
             const sections: string[] = [];
             if (identity) sections.push(`## Identity\n${identity}`);
+            if (facts_text) sections.push(`## Current Facts (${current_facts.length})\n${facts_text}`);
             if (essential_story.trim()) sections.push(`## Essential Context (${top_memories.length} memories)\n${essential_story.trim()}`);
             if (summary_text.trim()) sections.push(`## Recent Sessions (${recent_summaries.length})\n${summary_text.trim()}`);
 

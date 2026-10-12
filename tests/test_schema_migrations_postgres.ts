@@ -115,7 +115,23 @@ async function main() {
                     `select count(*)::integer as n from "${schema}"._om_migrations`,
                 )
             ).rows[0].n,
-            2,
+            3,
+        );
+        // Migration 4: facts are identified per project; legacy rows are global state facts.
+        await pool.query(
+            `insert into ${facts}(id,user_id,project,subject,predicate,object,valid_from) values($1,'alice','other','person','city','Paris',100)`,
+            [randomUUID()],
+        );
+        await assert.rejects(
+            pool.query(
+                `insert into ${facts}(id,user_id,project,subject,predicate,object,valid_from) values($1,'alice','other','person','city','Paris',100)`,
+                [randomUUID()],
+            ),
+            /unique constraint/,
+        );
+        assert.deepEqual(
+            (await pool.query(`select project,kind,source_memory_id from ${facts} where id=$1`, [fact])).rows,
+            [{ project: null, kind: "state", source_memory_id: null }],
         );
         assert.deepEqual(
             (
@@ -136,7 +152,7 @@ async function main() {
             child,
         );
         console.log(
-            "[PG MIGRATION] rollback, concurrent startup, backfill, tenant uniqueness and cascade passed",
+            "[PG MIGRATION] rollback, concurrent startup, backfill, tenant/project uniqueness and cascade passed",
         );
     } finally {
         await pool.query(`drop schema if exists "${schema}" cascade`);

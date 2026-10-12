@@ -13,12 +13,63 @@ Deleting rows from `_om_migrations` does not undo a migration.
 | 1 | Temporal facts become unique per `user_id` (partial unique indexes for owned/unowned facts). Adds `document_sections`, backfilled only from unambiguous legacy `meta.parent_id`/`section_index` pairs that share user and project. | Same. |
 | 2 | Adds nullable `vectors.provenance` (embedding provider/model/dimension). Existing vectors keep `NULL`. | Same. |
 | 3 | Rebuilds `memories_fts` (rows written before the index existed were never searchable) and limits the FTS update trigger to `content` changes. | Adds a GIN full-text index on memory content (created on startup). |
+| 4 | Adds `temporal_facts.project` (NULL = global), `kind` (`state` / `set` / `event`, default `state`) and `source_memory_id`. Fact identity becomes user + project + subject + predicate + object + `valid_from`. Existing facts become global `state` facts with no source. | Same. |
 
 The SQLite temporal rebuild only accepts the stock `temporal_facts` definition;
 a manually altered table aborts the migration instead of silently dropping
 columns.
 
 ## Behaviour changes worth knowing
+
+### Fact track (migration 4)
+
+- **Facts are project-scoped.** `openmemory_store` writes facts into the call's
+  `project` (default `default`), or into the global scope with
+  `scope: "global"`. A project query returns that project's facts plus global
+  ones. A fact in one project no longer ends a fact with the same
+  subject/predicate in another project. Facts written before this release
+  are global and therefore visible in every project; re-store them with a
+  `project` if they are project-specific.
+- **Update rules depend on `kind`.** `state` ends the previous value. A
+  backfilled older value is fitted into history without becoming current, and a
+  different value for the same start time is treated as a correction (the old
+  row is kept with an empty interval). `set` values coexist until retracted
+  with `openmemory_retract_fact`. `event` facts are instants and never replace
+  anything. Re-asserting a value that already holds reuses the existing fact.
+- **Subjects and predicates are normalised** on write and in exact-match
+  queries: subjects are lower-cased with whitespace collapsed, and predicates
+  become lower snake_case. Objects keep their case. Older rows keep their
+  original spelling; natural-language fact queries match them
+  case-insensitively.
+- **`type: "both"` is one transaction** and links each fact to the stored
+  observation (`source_memory_id`). If any fact is invalid, the observation is
+  not stored either. Deleting the observation keeps its facts and clears the
+  link.
+- **Queries.** `factual` queries without a `fact_pattern` match the query text
+  against subject, predicate and object, and return at most `fact_limit`
+  (default 20). Contextual results include `linked_facts`. If a linked state
+  fact has ended, the result is marked HISTORICAL with what replaced it.
+- **Wakeup** starts with up to 20 current `state`/`set` facts for the project
+  and global scope.
+
+### Other changes in this release
+
+- **CJK text.** Chinese, Japanese and Korean runs are tokenised into character
+  bigrams. Previously such text produced no tokens, so every pure-CJK memory
+  after the first was merged into it as a "duplicate" and shared one synthetic
+  vector. English-only text tokenises exactly as before. CJK memories stored
+  earlier keep their old, uninformative vectors; re-store important ones.
+- **Deduplication** now requires real token overlap (Jaccard ≥ 0.8) on top of a
+  SimHash match. Text with no tokens is only merged when it is identical.
+- **Embedding spaces are isolated.** Vector search and fusion scoring skip
+  stored vectors whose provenance (provider, model, transform, dimension)
+  differs from the query's, even when the dimensions match. A provider switch
+  or a fallback to synthetic embeddings therefore no longer produces
+  meaningless similarities. Those memories remain reachable through
+  full-text search. Legacy vectors without provenance are still compared.
+- **Postgres fixes:** a waypoint-expanded query no longer fails on a hardcoded
+  SQLite table name, and the temporal module no longer writes logs to stdout,
+  which would corrupt the MCP stdio stream.
 
 **Scope is a data boundary, not authentication.** `user_id` and `project` are
 caller-supplied filters. They are applied *before* ranking in vector, full-text

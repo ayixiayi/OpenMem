@@ -32,13 +32,24 @@ const stem_rules: Array<[RegExp, string]> = [
     [/ed$/, ""],
     [/s$/, ""],
 ];
-const tok_pat = /[a-z0-9]+/gi;
+const tok_pat = /[a-z0-9]+|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/giu;
+const cjk_run = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
+/**
+ * ASCII words, plus overlapping character bigrams for CJK runs (which have no
+ * spaces to split on). Without the bigrams every pure-CJK text produced an
+ * empty token set, so unrelated memories shared one SimHash and one vector.
+ */
 export const tokenize = (text: string): string[] => {
     const toks: string[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = tok_pat.exec(text))) {
-        toks.push(m[0].toLowerCase());
+    for (const [run] of text.matchAll(tok_pat)) {
+        if (!cjk_run.test(run)) {
+            toks.push(run.toLowerCase());
+            continue;
+        }
+        const chars = Array.from(run);
+        if (chars.length === 1) toks.push(run);
+        for (let i = 0; i + 1 < chars.length; i++) toks.push(chars[i] + chars[i + 1]);
     }
     return toks;
 };
