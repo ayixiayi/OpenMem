@@ -1,5 +1,5 @@
 import { VectorStore, StoredEmbedding } from "../vector_store";
-import { EmbeddingProvenance, validateVector, validateProvenance } from "../embedding_contract";
+import { EmbeddingProvenance, validateVector, validateProvenance, inSpace } from "../embedding_contract";
 import Redis from "ioredis";
 import { env } from "../cfg";
 import { vectorToBuffer, bufferToVector } from "../../memory/embed";
@@ -65,7 +65,7 @@ export class ValkeyVectorStore implements VectorStore {
         } while (cursor !== "0");
     }
 
-    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string): Promise<Array<{ id: string; score: number }>> {
+    async searchSimilar(sector: string, queryVec: number[], topK: number, user_id?: string, project?: string, space?: string): Promise<Array<{ id: string; score: number }>> {
         validateVector(queryVec, queryVec.length);
         // Metadata is authoritative for scope. Rank its vectors before limiting;
         // a global KNN followed by filtering can discard every eligible memory.
@@ -75,12 +75,13 @@ export class ValkeyVectorStore implements VectorStore {
             for (let offset = 0; offset < ids.length; offset += 100) {
                 const batch = ids.slice(offset, offset + 100);
                 const pipeline = this.client.pipeline();
-                for (const id of batch) pipeline.hgetBuffer(this.getKey(id, sector), "v");
+                for (const id of batch) pipeline.hmgetBuffer(this.getKey(id, sector), "v", "provenance");
                 const rows = await pipeline.exec();
                 rows?.forEach(([error, value], index) => {
                     if (error) throw error;
-                    if (value) {
-                        const vector = bufferToVector(value as Buffer);
+                    const [v, provenance] = (value ?? []) as Array<Buffer | null>;
+                    if (v && inSpace(provenance ? JSON.parse(provenance.toString()) : null, space)) {
+                        const vector = bufferToVector(v);
                         if (vector.length === queryVec.length) results.push({ id: batch[index], score: this.cosineSimilarity(queryVec, vector) });
                     }
                 });

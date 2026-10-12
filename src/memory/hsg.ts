@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { canonical_token_set } from "../utils/text";
+import { embeddingSpace, inSpace } from "../core/embedding_contract";
 import { inc_q, dec_q, on_query_hit } from "./decay";
 import { env, tier } from "../core/cfg";
 import { cos_sim, buf_to_vec, vec_to_buf } from "../utils/index";
@@ -155,7 +156,7 @@ export const sector_relationships: Record<string, Record<string, number>> = {
 };
 
 
-const fts_stopwords = new Set([
+export const fts_stopwords = new Set([
     "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for",
     "from", "how", "in", "is", "it", "of", "on", "or", "that", "the", "this",
     "to", "was", "we", "what", "when", "where", "which", "who", "why", "with",
@@ -350,6 +351,19 @@ export function hamming_dist(hash1: string, hash2: string): number {
             (xor & 1 ? 1 : 0);
     }
     return dist;
+}
+/**
+ * SimHash equality is only a prefilter: short or token-poor texts collide
+ * easily. Require real token overlap, and exact equality when either side
+ * has no tokens at all.
+ */
+export function is_near_duplicate(a: string, b: string): boolean {
+    const ta = canonical_token_set(a);
+    const tb = canonical_token_set(b);
+    if (!ta.size || !tb.size) return a.trim() === b.trim();
+    let inter = 0;
+    for (const t of ta) if (tb.has(t)) inter++;
+    return inter / (ta.size + tb.size - inter) >= 0.8;
 }
 export function sigmoid(x: number): number {
     return 1 / (1 + Math.exp(-x));
@@ -624,7 +638,6 @@ export async function prune_weak_waypoints(): Promise<number> {
 }
 import {
     embedForSector,
-    embedQueryForAllSectors,
     embedQueryWithProvenance,
     embedMultiSector,
     cosineSimilarity,
@@ -653,6 +666,7 @@ export async function calc_multi_vec_fusion_score(
     mid: string,
     qe: Record<string, number[]>,
     w: multi_vec_fusion_weights,
+    spaces?: Record<string, string>,
 ): Promise<number> {
     const vecs = await vector_store.getVectorsById(mid);
     let sum = 0,
@@ -667,6 +681,7 @@ export async function calc_multi_vec_fusion_score(
     for (const v of vecs) {
         const qv = qe[v.sector];
         if (!qv || qv.length !== v.vector.length) continue;
+        if (!inSpace(v.provenance, spaces?.[v.sector])) continue;
         const mv = v.vector;
         const sim = cosineSimilarity(qv, mv);
         const wgt = wm[v.sector] || 0.5;
@@ -732,7 +747,13 @@ export async function hsg_query(
         }
         if (!ss.length) ss.push("semantic");
 
-        const qe = await embedQueryForAllSectors(qt, ss);
+        const qp = await embedQueryWithProvenance(qt, ss);
+        const qe: Record<string, number[]> = {};
+        const spaces: Record<string, string> = {};
+        for (const [sec, emb] of Object.entries(qp)) {
+            qe[sec] = emb.vector;
+            spaces[sec] = embeddingSpace(emb.provenance);
+        }
         const w: multi_vec_fusion_weights = {
             semantic_dimension_weight: qc.primary === "semantic" ? 1.2 : 0.8,
             emotional_dimension_weight: qc.primary === "emotional" ? 1.5 : 0.6,
@@ -748,7 +769,7 @@ export async function hsg_query(
         > = {};
         for (const s of ss) {
             const qv = qe[s];
-            const results = await vector_store.searchSimilar(s, qv, k * 3, f?.user_id, f?.project);
+            const results = await vector_store.searchSimilar(s, qv, k * 3, f?.user_id, f?.project, spaces[s]);
             sr[s] = results.map(r => ({ id: r.id, similarity: r.score }));
         }
         const all_sims = Object.values(sr).flatMap((r) =>
@@ -804,7 +825,7 @@ export async function hsg_query(
             if (f?.project && m.project !== f.project) continue;
             if (f?.startTime && m.created_at < f.startTime) continue;
             if (f?.endTime && m.created_at > f.endTime) continue;
-            const mvf = await calc_multi_vec_fusion_score(mid, qe, w);
+            const mvf = await calc_multi_vec_fusion_score(mid, qe, w, spaces);
             const csr = await calculateCrossSectorResonanceScore(
                 m.primary_sector,
                 qc.primary,
@@ -989,6 +1010,8 @@ export async function add_hsg_memory(
     project?: string,
     session_id?: string,
     observation_type?: string,
+    /** Runs in the same transaction once the memory id is known (new or deduplicated). */
+    within?: (memory_id: string) => Promise<void>,
 ): Promise<{
     id: string;
     primary_sector: string;
@@ -1013,9 +1036,19 @@ export async function add_hsg_memory(
         const existing = await q.get_mem_by_simhash.get(
             simhash, user_id || "anonymous", project ?? "default",
         );
-        if (existing && hamming_dist(simhash, existing.simhash) <= 3) {
+        const stored_content = extract_essence(
+            content,
+            classification.primary,
+            env.summary_max_length,
+        );
+        if (
+            existing &&
+            hamming_dist(simhash, existing.simhash) <= 3 &&
+            is_near_duplicate(stored_content, existing.content)
+        ) {
             const boosted_sal = Math.min(1, existing.salience + 0.15);
             await q.upd_seen.run(existing.id, now, boosted_sal, now);
+            await within?.(existing.id);
             return {
                 id: existing.id,
                 primary_sector: existing.primary_sector,
@@ -1034,11 +1067,6 @@ export async function add_hsg_memory(
                 `[HSG] Rotated to segment ${cur_seg} (previous segment full: ${seg_cnt} memories)`,
             );
         }
-        const stored_content = extract_essence(
-            content,
-            classification.primary,
-            env.summary_max_length,
-        );
         const sec_cfg = sector_configs[classification.primary];
         const init_sal = Math.max(
             0,
@@ -1095,6 +1123,7 @@ export async function add_hsg_memory(
         }
 
         await create_single_waypoint(id, mean_vec, now, user_id);
+        await within?.(id);
         return {
             id,
             primary_sector: classification.primary,
@@ -1110,6 +1139,8 @@ export async function delete_memory(id: string): Promise<boolean> {
         await vector_store.deleteVectors(id);
         await q.del_mem.run(id);
         await q.del_waypoints.run(id, id);
+        // Facts outlive the observation they came from; drop only the link.
+        await run_async("update temporal_facts set source_memory_id=null where source_memory_id=?", [id]);
         return true;
     });
 }

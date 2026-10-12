@@ -4,7 +4,7 @@ import { get_subject_timeline, get_predicate_timeline, get_changes_in_window, co
 
 export const create_temporal_fact = async (req: any, res: any) => {
     try {
-        const { subject, predicate, object, valid_from, confidence, metadata, user_id } = req.body
+        const { subject, predicate, object, valid_from, confidence, metadata, user_id, project, kind, source_memory_id } = req.body
 
         if (!subject || !predicate || !object) {
             return res.status(400).json({ error: 'Missing required fields: subject, predicate, object' })
@@ -13,7 +13,11 @@ export const create_temporal_fact = async (req: any, res: any) => {
         const valid_from_date = valid_from ? new Date(valid_from) : new Date()
         const conf = confidence !== undefined ? Math.max(0, Math.min(1, confidence)) : 1.0
 
-        const id = await insert_fact(subject, predicate, object, valid_from_date, conf, metadata, user_id)
+        if (kind !== undefined && !['state', 'set', 'event'].includes(kind)) {
+            return res.status(400).json({ error: "kind must be 'state', 'set' or 'event'" })
+        }
+
+        const id = await insert_fact(subject, predicate, object, valid_from_date, conf, metadata, user_id, { project: project || null, kind, source_memory_id })
 
         res.json({
             id,
@@ -22,6 +26,8 @@ export const create_temporal_fact = async (req: any, res: any) => {
             object,
             valid_from: valid_from_date.toISOString(),
             confidence: conf,
+            project: project || null,
+            kind: kind ?? 'state',
             message: 'Fact created successfully'
         })
     } catch (error) {
@@ -33,7 +39,7 @@ export const create_temporal_fact = async (req: any, res: any) => {
 
 export const get_temporal_fact = async (req: any, res: any) => {
     try {
-        const { subject, predicate, object, at, min_confidence, user_id } = req.query
+        const { subject, predicate, object, at, min_confidence, user_id, project } = req.query
 
         if (!subject && !predicate && !object) {
             return res.status(400).json({ error: 'At least one of subject, predicate, or object is required' })
@@ -42,7 +48,7 @@ export const get_temporal_fact = async (req: any, res: any) => {
         const at_date = at ? new Date(at) : new Date()
         const min_conf = min_confidence ? parseFloat(min_confidence) : 0.1
 
-        const facts = await query_facts_at_time(subject, predicate, object, at_date, min_conf, user_id)
+        const facts = await query_facts_at_time(subject, predicate, object, at_date, min_conf, user_id, { project })
 
         res.json({
             facts,

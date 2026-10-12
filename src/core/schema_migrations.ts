@@ -46,6 +46,24 @@ function legacy_sections(rows: any[]): Array<[string, number, string]> {
     );
 }
 
+/**
+ * Facts become project-scoped (NULL project = global) and typed:
+ * `state` (one value at a time), `set` (values coexist) or `event` (an
+ * instant). Identity is user + project + subject + predicate + object + time.
+ */
+function fact_scope_migration(facts: string, index_prefix: string): string[] {
+    return [
+        `alter table ${facts} add column project text`,
+        `alter table ${facts} add column kind text not null default 'state' check(kind in ('state','set','event'))`,
+        `alter table ${facts} add column source_memory_id text`,
+        `drop index if exists ${index_prefix}temporal_owned_identity`,
+        `drop index if exists ${index_prefix}temporal_unowned_identity`,
+        `create unique index temporal_identity on ${facts}(coalesce(user_id,''),coalesce(project,''),subject,predicate,object,valid_from)`,
+        `create index temporal_scope_key on ${facts}(user_id,project,subject,predicate,valid_from)`,
+        `create index temporal_source on ${facts}(source_memory_id)`,
+    ];
+}
+
 export async function migrate_sqlite(db: sqlite3.Database): Promise<void> {
     const run = (sql: string, params: any[] = []) =>
         new Promise<void>((resolve, reject) =>
@@ -156,6 +174,13 @@ export async function migrate_sqlite(db: sqlite3.Database): Promise<void> {
             }
             await run("insert into _om_migrations values(3)");
         }
+        if (
+            !(await all("select version from _om_migrations where version=4"))
+                .length
+        ) {
+            for (const sql of fact_scope_migration("temporal_facts", "")) await run(sql);
+            await run("insert into _om_migrations values(4)");
+        }
         await run("COMMIT");
     } catch (error) {
         await run("ROLLBACK");
@@ -235,6 +260,17 @@ export async function migrate_postgres(
                 `alter table ${vectors} add column provenance text`,
             );
             await client.query(`insert into ${versions} values(2)`);
+        }
+        if (
+            !(
+                await client.query(
+                    `select version from ${versions} where version=4`,
+                )
+            ).rows.length
+        ) {
+            for (const sql of fact_scope_migration(facts, `${prefix}.`))
+                await client.query(sql);
+            await client.query(`insert into ${versions} values(4)`);
         }
         await client.query("COMMIT");
     } catch (error) {
